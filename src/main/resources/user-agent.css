@@ -1,0 +1,418 @@
+/* PeakyBrowser4J - User Agent Stylesheet */
+
+/* Document structure */
+
+html {
+    display: block;
+}
+
+body {
+    display: block;
+    margin: 8px;
+    padding: 0;
+    color: #000000;
+    background-color: #ffffff;
+    font-family: sans-serif;
+    font-size: 16px;
+}
+
+head,
+meta,
+title,
+link,
+style,
+script,
+template,
+noscript {
+    display: none;
+}
+
+
+/* Block elements */
+
+address,
+article,
+aside,
+blockquote,
+body,
+dd,
+div,
+dl,
+dt,
+fieldset,
+figcaption,
+figure,
+footer,
+form,
+h1,
+h2,
+h3,
+h4,
+h5,
+h6,
+header,
+hgroup,
+main,
+nav,
+ol,
+p,
+pre,
+section,
+table,
+ul {
+    display: block;
+}
+
+
+/* Headings */
+
+h1 {
+    display: block;
+    font-size: 2em;
+    font-weight: bold;
+    margin: 0.67em 0;
+}
+
+h2 {
+    display: block;
+    font-size: 1.5em;
+    font-weight: bold;
+    margin: 0.83em 0;
+}
+
+h3 {
+    display: block;
+    font-size: 1.17em;
+    font-weight: bold;
+    margin: 1em 0;
+}
+
+h4 {
+    display: block;
+    font-size: 1em;
+    font-weight: bold;
+    margin: 1.33em 0;
+}
+
+h5 {
+    display: block;
+    font-size: 0.83em;
+    font-weight: bold;
+    margin: 1.67em 0;
+}
+
+h6 {
+    display: block;
+    font-size: 0.67em;
+    font-weight: bold;
+    margin: 2.33em 0;
+}
+
+
+/* Text */
+
+p {
+    display: block;
+    margin: 1em 0;
+}
+
+blockquote {
+    display: block;
+    margin: 1em 40px;
+}
+
+pre {
+    display: block;
+    font-family: monospace;
+    white-space: pre;
+    margin: 1em 0;
+}
+
+code,
+kbd,
+samp,
+tt {
+    font-family: monospace;
+}
+
+strong,
+b {
+    font-weight: bold;
+}
+
+em,
+i {
+    font-style: italic;
+}
+
+small {
+    font-size: smaller;
+}
+
+big {
+    font-size: larger;
+
+}
+
+sub {
+    vertical-align: sub;
+    font-size: smaller;
+}
+
+sup {
+    vertical-align: super;
+    font-size: smaller;
+}
+
+
+/* Lists */
+
+ul,
+ol,
+menu {
+    display: block;
+    margin: 1em 0;
+    padding-left: 40px;
+}
+
+ul {
+    list-style-type: disc;
+}
+
+ol {
+    list-style-type: decimal;
+}
+
+li {
+    display: list-item;
+}
+
+ul ul {
+    list-style-type: circle;
+}
+
+ul ul ul {
+    list-style-type: square;
+}
+
+
+/* Links */
+
+a {
+    display: inline;
+    color: #0000ee;
+    text-decoration: underline;
+}
+
+a:visited {
+    color: #551a8b;
+}
+
+a:hover {
+    text-decoration: underline;
+}
+
+a:active {
+    color: #ff0000;
+}
+
+
+/* Horizontal rule */
+
+hr {
+    display: block;
+    margin: 0.5em auto;
+    border: 1px inset;
+}
+
+
+/* Tables */
+
+table {
+    display: table;
+    border-collapse: separate;
+    border-spacing: 2px;
+    border: none;
+}
+
+caption {
+    display: table-caption;
+    text-align: center;
+}
+
+tbody {
+    display: table-row-group;
+}
+
+thead {
+    display: table-header-group;
+}
+
+tfoot {
+    display: table-footer-group;
+}
+
+tr {
+    display: table-row;
+}
+
+td,
+th {
+    display: table-cell;
+    vertical-align: inherit;
+    padding: 1px;
+    border: none;
+}
+
+th {
+    font-weight: bold;
+}
+
+
+/* Forms */
+
+form {
+    display: block;
+}
+
+fieldset {
+    display: block;
+    margin: 0 2px;
+    padding: 0.35em 0.75em 0.625em;
+    border: 2px groove;
+}
+
+legend {
+    display: block;
+    padding: 0 2px;
+}
+
+label {
+    display: inline;
+}
+
+input,
+textarea,
+select,
+button {
+    font-family: Arial, sans-serif;
+    font-size: 13.3333px;
+}
+
+input {
+    display: inline-block;
+}
+
+textarea {
+    display: inline-block;
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
+}
+
+select {
+    display: inline-block;
+}
+
+button {
+    display: inline-block;
+    text-align: center;
+    box-sizing: border-box;
+}
+
+
+/* Images */
+
+img {
+    display: inline-block;
+}
+
+canvas {
+    display: inline-block;
+}
+
+svg {
+    display: inline-block;
+}
+
+
+/* Media */
+
+audio,
+video {
+    display: inline-block;
+}
+
+audio:not([controls]) {
+    display: none;
+}
+
+
+/* Details */
+
+details {
+    display: block;
+}
+
+summary {
+    display: list-item;
+}
+
+
+/* Quotes */
+
+q {
+    quotes: '"' '"' "'" "'";
+}
+
+
+/* Abbreviations */
+
+abbr[title] {
+    text-decoration: underline dotted;
+}
+
+
+/* Miscellaneous */
+
+center {
+    display: block;
+    text-align: center;
+}
+
+pre,
+code,
+kbd,
+samp {
+    font-family: monospace;
+}
+
+[hidden] {
+    display: none;
+}
+
+
+/* Default focus behavior */
+
+:focus {
+    outline: 1px dotted;
+}
+
+
+/* Common replaced-element defaults */
+
+iframe {
+    border: 2px inset;
+}
+
+object {
+    display: inline;
+}
+
+embed {
+    display: inline;
+}
+
+center {
+    display: block;
+    text-align: center;
+}

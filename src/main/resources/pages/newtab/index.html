@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PeakySearch</title>
+
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<main class="search-page">
+    <section class="search-container">
+        <div class="logo">
+            <span>Peaky</span><span>Search</span>
+        </div>
+
+        <p class="tagline">Search the web. Keep it simple.</p>
+
+        <form id="search-form" class="search-form">
+            <div class="search-box">
+                <span class="search-icon">⌕</span>
+
+                <input
+                        id="search-input"
+                        type="search"
+                        name="q"
+                        placeholder="Search the web..."
+                        autocomplete="off"
+                        spellcheck="false"
+                >
+
+                <button
+                        id="clear-button"
+                        class="clear-button"
+                        type="button"
+                        aria-label="Clear search"
+                        hidden
+                >
+                    ×
+                </button>
+            </div>
+
+            <div class="buttons">
+                <button type="submit" class="search-button">
+                    Search
+                </button>
+
+                <button type="button" class="lucky-button" id="lucky-button">
+                    I'm Feeling Lucky
+                </button>
+            </div>
+        </form>
+    </section>
+</main>
+
+<footer>
+    <span>PeakySearch</span>
+    <span>•</span>
+    <span>Made for PeakyBrowser4J</span>
+</footer>
+
+<script src="script.js"></script>
+</body>
+</html>

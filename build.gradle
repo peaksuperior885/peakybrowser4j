@@ -1,0 +1,81 @@
+plugins {
+    id 'java'
+    id 'application'
+    id 'com.github.johnrengelman.shadow' version '8.1.1'
+}
+
+group = 'com.peak885.peakybrowser4jv2'
+version = '1.0-SNAPSHOT'
+
+java {
+    toolchain.languageVersion = JavaLanguageVersion.of(17)
+}
+
+repositories {
+    mavenCentral()
+    maven { url 'https://jitpack.io' }
+    flatDir { dirs 'libs' }
+}
+
+dependencies {
+    implementation 'com.formdev:flatlaf:3.7.1'
+    implementation 'com.formdev:flatlaf-extras:3.7.1'
+    implementation 'com.github.mikaelgrev.miglayout:lib-miglayout-NB90:v11.4.2'
+
+    implementation 'com.github.tamkungz:jlayer-custom:1.1.3' //roach mp3.exe
+
+    implementation 'com.helger:ph-css:8.2.1' // yes
+
+    implementation 'org.mozilla:rhino:1.9.1' // The engine
+
+    implementation 'com.github.rtyley:animated-gif-lib-for-java:animated-gif-lib-1.7' //for both
+    implementation 'com.twelvemonkeys.imageio:imageio-core:3.13.1' // for sites
+    implementation 'com.twelvemonkeys.imageio:imageio-metadata:3.13.1' // for sites
+
+    implementation 'com.twelvemonkeys.imageio:imageio-jpeg:3.13.1' // for sites
+    implementation 'com.twelvemonkeys.imageio:imageio-bmp:3.13.1' // for sites
+    implementation 'com.twelvemonkeys.imageio:imageio-tiff:3.13.1' // for sites
+    implementation 'com.twelvemonkeys.imageio:imageio-webp:3.13.1' // for sites
+    implementation 'com.twelvemonkeys.imageio:imageio-tga:3.13.1' // for sites
+    implementation 'com.twelvemonkeys.imageio:imageio-pnm:3.13.1' // for sites
+    implementation 'com.twelvemonkeys.imageio:imageio-batik:3.13.1' // for sites
+    implementation 'org.apache.xmlgraphics:batik-transcoder:1.18' // for sites
+    implementation 'org.apache.xmlgraphics:batik-codec:1.18' // for sites
+    //implementation 'com.kitfox.svg:svg-salamander:1.0'
+    implementation 'io.github.blackears:svg-salamander:1.1.5.5' //for my own browser ui not sites
+
+    implementation 'org.xerial:sqlite-jdbc:3.45.1.0' //COOKIES
+
+    implementation 'com.github.ben-manes.caffeine:caffeine:3.2.4'
+
+    implementation 'org.jsoup:jsoup:1.23.1' //who knew actual browsing needs an agent
+    implementation 'com.squareup.okhttp3:okhttp:4.12.0' //who knew actual browsing needs an agent
+    implementation 'com.google.code.gson:gson:2.14.0' //i pronounce JSON Java-Son for sum reason
+
+    implementation "org.slf4j:slf4j-api:2.0.12" //something required slf4j but we are still gonna use tinylog because it better
+    implementation "org.tinylog:slf4j-tinylog:2.7.0" //something required slf4j but we are still gonna use tinylog because it better
+    implementation 'org.tinylog:tinylog-api:2.7.0' //you know the saying, no logger = something wrong with you
+    implementation 'org.tinylog:tinylog-impl:2.7.0' //you know the saying, no logger = something wrong with you
+
+    compileOnly 'org.jetbrains:annotations:26.0.2' //annotations
+
+    testImplementation platform('org.junit:junit-bom:5.10.0')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+}
+
+application {
+    mainClass = 'com.peak885.peakybrowser4jv2.Main'
+}
+
+shadowJar {
+    archiveClassifier.set('all')
+    manifest {
+        attributes 'Main-Class': application.mainClass
+    }
+
+    mergeServiceFiles()
+}
+
+test {
+    useJUnitPlatform()
+}
