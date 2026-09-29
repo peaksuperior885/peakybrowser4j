@@ -8,6 +8,8 @@ import org.jetbrains.annotations.Nullable;
 import java.awt.Font;
 import java.awt.FontMetrics;
 import java.awt.Graphics2D;
+import java.awt.Toolkit;
+import java.awt.Color;
 import java.awt.image.BufferedImage;
 import java.util.List;
 
@@ -30,6 +32,9 @@ public final class InlineBox extends Box {
 
     float ascent;
     float descent;
+
+    private int selectionStart = -1;
+    private int selectionEnd = -1;
 
     // Animation tracking state for animated image frames
     private int currentFrameIndex = 0;
@@ -200,18 +205,33 @@ public final class InlineBox extends Box {
         Font font = createFont();
 
         g.setFont(font);
-        g.setColor(style.color());
-
         FontMetrics fm = g.getFontMetrics();
 
         int drawX = Math.round(x);
         int baseline = Math.round(y + fm.getAscent());
 
-        g.drawString(
-                text,
-                drawX,
-                baseline
-        );
+        int selectedFrom = Math.max(0, Math.min(text.length(), selectionStart));
+        int selectedTo = Math.max(selectedFrom, Math.min(text.length(), selectionEnd));
+
+        g.setColor(style.color());
+        if (selectedFrom < selectedTo) {
+            int selectionX = drawX + fm.stringWidth(text.substring(0, selectedFrom));
+            int selectionRight = drawX + fm.stringWidth(text.substring(0, selectedTo));
+            g.setColor(new Color(55, 125, 235));
+            g.fillRect(selectionX, baseline - fm.getAscent(), selectionRight - selectionX, fm.getHeight());
+            g.setColor(Color.WHITE);
+            g.drawString(text.substring(selectedFrom, selectedTo), selectionX, baseline);
+            g.setColor(style.color());
+            if (selectedFrom > 0) {
+                g.drawString(text.substring(0, selectedFrom), drawX, baseline);
+            }
+            if (selectedTo < text.length()) {
+                int suffixX = drawX + fm.stringWidth(text.substring(0, selectedTo));
+                g.drawString(text.substring(selectedTo), suffixX, baseline);
+            }
+        } else {
+            g.drawString(text, drawX, baseline);
+        }
 
         if (style.textDecorationUnderline()) {
             int underlineY = baseline + Math.max(
@@ -318,5 +338,36 @@ public final class InlineBox extends Box {
                 && px <= borderBoxX + borderBoxWidth
                 && py >= borderBoxY
                 && py <= borderBoxY + borderBoxHeight;
+    }
+
+    public void setSelection(int start, int end) {
+        selectionStart = Math.max(0, Math.min(text.length(), start));
+        selectionEnd = Math.max(selectionStart, Math.min(text.length(), end));
+        if (selectionStart == selectionEnd) {
+            selectionStart = selectionEnd = -1;
+        }
+    }
+
+    public void clearSelection() {
+        selectionStart = selectionEnd = -1;
+    }
+
+    public int selectionStart() {
+        return selectionStart;
+    }
+
+    public int selectionEnd() {
+        return selectionEnd;
+    }
+
+    public int textOffsetAt(float px) {
+        FontMetrics fm = Toolkit.getDefaultToolkit().getFontMetrics(createFont());
+        float relativeX = px - x;
+        for (int i = 0; i < text.length(); i++) {
+            int left = fm.stringWidth(text.substring(0, i));
+            int right = fm.stringWidth(text.substring(0, i + 1));
+            if (relativeX < (left + right) / 2f) return i;
+        }
+        return text.length();
     }
 }

@@ -12,7 +12,38 @@ public final class JsAsyncTransformer {
         if (script == null || script.isBlank()) {
             return script;
         }
-        return transformAsyncFunctions(script);
+
+        String result = transformAsyncFunctions(script);
+        result = transformAsyncArrows(result);
+
+        return result;
+    }
+
+    /**
+     * Strips "async" wherever it directly precedes an arrow function
+     * signature - "async () => {...}", "async (a, b) => {...}", and the
+     * single-bare-parameter form "async x => {...}".
+     *
+     * Rhino has no idea what to do with the "async" keyword sitting in
+     * front of an arrow function: it tries to reinterpret the parameter
+     * list mid-parse and throws "missing formal parameter", which aborts
+     * compilation of the WHOLE script, not just this one function.
+     *
+     * Plain (non-async) arrow functions already work fine in this Rhino
+     * version, so dropping "async" is enough to make the signature
+     * parse; any "await" left inside the body is handled later by
+     * JsPreprocessor's blanket "\bawait\s+" strip.
+     */
+    private static String transformAsyncArrows(String script) {
+        Pattern pattern = Pattern.compile(
+                "\\basync\\s*"
+                        + "(\\([^()]*\\)|[A-Za-z_$][A-Za-z0-9_$]*)"
+                        + "\\s*=>"
+        );
+
+        Matcher matcher = pattern.matcher(script);
+
+        return matcher.replaceAll(mr -> mr.group(1) + " =>");
     }
 
     private static String transformAsyncFunctions(String script) {

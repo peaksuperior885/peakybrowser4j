@@ -10,6 +10,8 @@ import org.tinylog.Logger;
 
 import javax.swing.JComponent;
 import java.awt.Cursor;
+import java.awt.Toolkit;
+import java.awt.datatransfer.StringSelection;
 import java.awt.event.KeyAdapter;
 import java.awt.event.KeyEvent;
 import java.awt.event.MouseEvent;
@@ -20,6 +22,8 @@ import java.nio.charset.StandardCharsets;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * Central input controller for the render surface.
@@ -51,6 +55,10 @@ public final class Inputs implements MouseListener, MouseMotionListener {
     private Element hoveredElement;
     private Element activeElement;
     private ElementBox focusedControl;
+    private InlineBox selectionAnchor;
+    private int selectionAnchorOffset;
+    private boolean selectionDragged;
+    private List<InlineBox> selectedRuns = List.of();
 
     private BiConsumer<Integer, Integer> onLeftClick;
     private Consumer<String> onNavigate = href -> {};
@@ -67,6 +75,11 @@ public final class Inputs implements MouseListener, MouseMotionListener {
 
             @Override
             public void keyPressed(KeyEvent e) {
+                if (e.isControlDown() && e.getKeyCode() == KeyEvent.VK_C
+                        && copySelection()) {
+                    e.consume();
+                    return;
+                }
                 if (handleControlKey(e)) {
                     e.consume();
                     return;
@@ -164,6 +177,16 @@ public final class Inputs implements MouseListener, MouseMotionListener {
     @Override
     public void mouseDragged(MouseEvent e) {
         updatePosition(e);
+        if (leftDown && selectionAnchor != null) {
+            InlineBox endpoint = findTextAt(rootBoxSupplier.get(), mouseX, mouseY);
+            if (endpoint == null) endpoint = nearestText(rootBoxSupplier.get(), mouseX, mouseY);
+            if (endpoint != null) {
+                updateTextSelection(endpoint, endpoint.textOffsetAt(mouseX));
+                selectionDragged = endpoint != selectionAnchor
+                        || endpoint.textOffsetAt(mouseX) != selectionAnchorOffset;
+                onRepaint.run();
+            }
+        }
         updateHover();
     }
 
@@ -173,6 +196,13 @@ public final class Inputs implements MouseListener, MouseMotionListener {
 
         if (e.getButton() == MouseEvent.BUTTON1) {
             leftDown = true;
+            selectionDragged = false;
+            clearTextSelection();
+            InlineBox text = findTextAt(rootBoxSupplier.get(), mouseX, mouseY);
+            if (text != null) {
+                selectionAnchor = text;
+                selectionAnchorOffset = text.textOffsetAt(mouseX);
+            }
             Element target = findElementAt(
                     rootBoxSupplier.get(), null, mouseX, mouseY);
             if (activeElement != target) {
@@ -194,6 +224,9 @@ public final class Inputs implements MouseListener, MouseMotionListener {
 
         if (e.getButton() == MouseEvent.BUTTON1) {
             leftDown = false;
+            if (!selectionDragged) {
+                clearTextSelection();
+            }
             if (activeElement != null) {
                 activeElement = null;
                 onInteractionChange.run();
@@ -210,6 +243,11 @@ public final class Inputs implements MouseListener, MouseMotionListener {
         updatePosition(e);
 
         if (e.getButton() != MouseEvent.BUTTON1) {
+            return;
+        }
+
+        if (selectionDragged) {
+            selectionDragged = false;
             return;
         }
 
@@ -264,17 +302,14 @@ public final class Inputs implements MouseListener, MouseMotionListener {
 
                 boolean submitsForm =
                         "submit".equalsIgnoreCase(type)
-                                || (
-                                "button".equalsIgnoreCase(tag)
-                                        && !type.isBlank()
-                                        && "submit".equalsIgnoreCase(type)
-                        );
+                                || ("button".equalsIgnoreCase(tag)
+                                && (type.isBlank() || "submit".equalsIgnoreCase(type)));
 
                 if (submitsForm) {
                     Element form = element.closest("form");
 
                     if (form != null) {
-                        submitForm(form);
+                        submitForm(form, element);
                         onRepaint.run();
                         return;
                     }
@@ -397,6 +432,103 @@ public final class Inputs implements MouseListener, MouseMotionListener {
         return false;
     }
 
+    private boolean copySelection() {
+        if (selectedRuns.isEmpty()) return false;
+        StringBuilder selected = new StringBuilder();
+        int startRun = selectedRuns.get(0).selectionStart();
+        int endRun = selectedRuns.get(selectedRuns.size() - 1).selectionEnd();
+        for (int i = 0; i < selectedRuns.size(); i++) {
+            InlineBox run = selectedRuns.get(i);
+            int from = i == 0 ? startRun : 0;
+            int to = i == selectedRuns.size() - 1 ? endRun : run.text.length();
+            if (i > 0 && run.spaceBefore) selected.append(' ');
+            if (to > from) selected.append(run.text, from, to);
+        }
+        if (selected.length() == 0) return false;
+        try {
+            Toolkit.getDefaultToolkit().getSystemClipboard()
+                    .setContents(new StringSelection(selected.toString()), null);
+            return true;
+        } catch (IllegalStateException | java.awt.HeadlessException ex) {
+            return false;
+        }
+    }
+
+    private void updateTextSelection(InlineBox endpoint, int endpointOffset) {
+        List<InlineBox> runs = textRuns(rootBoxSupplier.get());
+        int anchorIndex = runs.indexOf(selectionAnchor);
+        int endpointIndex = runs.indexOf(endpoint);
+        if (anchorIndex < 0 || endpointIndex < 0) return;
+        int startIndex = Math.min(anchorIndex, endpointIndex);
+        int endIndex = Math.max(anchorIndex, endpointIndex);
+        int startOffset = anchorIndex <= endpointIndex ? selectionAnchorOffset : endpointOffset;
+        int endOffset = anchorIndex <= endpointIndex ? endpointOffset : selectionAnchorOffset;
+        for (int i = 0; i < runs.size(); i++) {
+            InlineBox run = runs.get(i);
+            if (i < startIndex || i > endIndex) {
+                run.clearSelection();
+            } else {
+                int from = i == startIndex ? startOffset : 0;
+                int to = i == endIndex ? endOffset : run.text.length();
+                run.setSelection(from, to);
+            }
+        }
+        List<InlineBox> selected = new ArrayList<>();
+        for (int i = startIndex; i <= endIndex; i++) {
+            InlineBox run = runs.get(i);
+            if (run.selectionStart() >= 0 && run.selectionEnd() > run.selectionStart()) {
+                selected.add(run);
+            }
+        }
+        selectedRuns = List.copyOf(selected);
+    }
+
+    public void clearTextSelection() {
+        for (InlineBox run : textRuns(rootBoxSupplier.get())) run.clearSelection();
+        selectedRuns = List.of();
+        selectionAnchor = null;
+        onRepaint.run();
+    }
+
+    private InlineBox findTextAt(Box box, float px, float py) {
+        if (box == null) return null;
+        for (Box child : box.children) {
+            InlineBox found = findTextAt(child, px, py);
+            if (found != null) return found;
+        }
+        if (box instanceof InlineBox inline && !inline.text.isEmpty()
+                && inline.containsPoint(px, py)) return inline;
+        if (box instanceof InlineBox inline && inline.isInlineBlock())
+            return findTextAt(inline.blockContent(), px, py);
+        return null;
+    }
+
+    private InlineBox nearestText(Box root, float px, float py) {
+        InlineBox best = null;
+        double bestDistance = Double.MAX_VALUE;
+        for (InlineBox run : textRuns(root)) {
+            double dx = px < run.x ? run.x - px : px > run.x + run.width ? px - run.x - run.width : 0;
+            double dy = py < run.y ? run.y - py : py > run.y + run.height ? py - run.y - run.height : 0;
+            double distance = dx * dx + dy * dy;
+            if (distance < bestDistance) { bestDistance = distance; best = run; }
+        }
+        return best;
+    }
+
+    private List<InlineBox> textRuns(Box root) {
+        List<InlineBox> runs = new ArrayList<>();
+        collectTextRuns(root, runs);
+        return runs;
+    }
+
+    private void collectTextRuns(Box box, List<InlineBox> runs) {
+        if (box == null) return;
+        if (box instanceof InlineBox inline && !inline.text.isEmpty()) runs.add(inline);
+        for (Box child : box.children) collectTextRuns(child, runs);
+        if (box instanceof InlineBox inline && inline.isInlineBlock())
+            collectTextRuns(inline.blockContent(), runs);
+    }
+
     private boolean handleControlTyped(KeyEvent e) {
         if (focusedControl == null
                 || !focusedControl.isTextual()) {
@@ -477,6 +609,10 @@ public final class Inputs implements MouseListener, MouseMotionListener {
     // ---------------------------------------------------------------------
 
     private void submitForm(Element form) {
+        submitForm(form, null);
+    }
+
+    private void submitForm(Element form, Element submitter) {
         if (form == null) {
             return;
         }
@@ -516,23 +652,24 @@ public final class Inputs implements MouseListener, MouseMotionListener {
 
         StringBuilder body = new StringBuilder();
 
-        for (Element input : form.select("input[name]")) {
+        for (Element input : form.select("input[name], button[name]")) {
             String name = input.attr("name");
 
             if (name.isBlank()) {
                 continue;
             }
 
-            Logger.info(
-                    "[INPUT] Form field: " + name + "=" + input.val()
-            );
-
             String type = input.attr("type");
+            boolean isButton = "button".equalsIgnoreCase(input.tagName());
+            boolean isSubmitControl = isButton
+                    ? type.isBlank() || "submit".equalsIgnoreCase(type)
+                    : "submit".equalsIgnoreCase(type);
 
-            // Submit buttons themselves are not successful controls
-            // unless they were specifically the submitter.
-            if ("submit".equalsIgnoreCase(type)
-                    || "button".equalsIgnoreCase(type)
+            // Only the submit control that initiated submission is successful.
+            if (isSubmitControl && input != submitter) {
+                continue;
+            }
+            if ("button".equalsIgnoreCase(type)
                     || "reset".equalsIgnoreCase(type)) {
                 continue;
             }
@@ -545,6 +682,10 @@ public final class Inputs implements MouseListener, MouseMotionListener {
                     continue;
                 }
             }
+
+            Logger.info(
+                    "[INPUT] Form field: " + name + "=" + input.val()
+            );
 
             if (body.length() > 0) {
                 body.append('&');

@@ -136,6 +136,7 @@ public final class RenderView
 
     /** Must be called on the EDT. Installs an already-built page (see {@link #buildLayout}) and repaints. */
     public void applyLoadedPage(LoadedPage page) {
+        inputs.clearTextSelection();
         this.currentDocument = page.document();
         this.rootBox = page.rootBox();
         this.jsBridge = page.jsBridge();
@@ -153,6 +154,7 @@ public final class RenderView
     }
 
     public void clear() {
+        inputs.clearTextSelection();
         rootBox = null;
         currentDocument = null;
         jsBridge = null;
@@ -196,6 +198,7 @@ public final class RenderView
                 }
 
                 try {
+                    inputs.clearTextSelection();
                     rootBox = get();
                     revalidate();
                     repaint();
