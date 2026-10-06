@@ -2212,28 +2212,6 @@ public final class BrowserWindow {
         );
     }
 
-    /**
-     * Public API – loads the given URL
-     * in the currently active tab.
-     */
-    public void load(
-            String url
-    ) {
-        if (activeTab != null) {
-
-            loadInTab(
-                    activeTab,
-                    url
-            );
-
-        } else {
-
-            openNewTab(
-                    url
-            );
-        }
-    }
-
     // ── Inner class: Browser tab ──────────────────────────────────────────
 
     private class BrowserTab {

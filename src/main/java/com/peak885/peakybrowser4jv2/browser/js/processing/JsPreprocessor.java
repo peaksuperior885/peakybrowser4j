@@ -27,15 +27,48 @@ public final class JsPreprocessor {
         );
 
         processed = JsClassTransformer.transform(processed);
+        checkForCorruption("JsClassTransformer", processed);
+
         processed = JsSyntaxCompat.transformRestAndSpread(processed);
+        checkForCorruption("transformRestAndSpread", processed);
+
         processed = JsAsyncTransformer.transform(processed);
+        checkForCorruption("JsAsyncTransformer", processed);
+
         processed = JsLoopTransformer.transformForEach(processed);
+        checkForCorruption("transformForEach", processed);
+
         processed = JsLoopTransformer.transformForEachExpression(processed);
+        checkForCorruption("transformForEachExpression", processed);
+
         processed = JsLoopTransformer.transformForOf(processed);
+        checkForCorruption("transformForOf", processed);
+
         processed = JsSyntaxCompat.stripDefaultParameters(processed);
+        checkForCorruption("stripDefaultParameters", processed);
+
         processed = JsSyntaxCompat.transformSimpleNullish(processed);
+        checkForCorruption("transformSimpleNullish", processed);
+
         processed = JsSyntaxCompat.normalizeKeywords(processed);
+        checkForCorruption("normalizeKeywords", processed);
 
         return processed;
+    }
+
+    private static void checkForCorruption(String stage, String script) {
+        String marker = "void 0.";
+
+        int index = script.indexOf(marker);
+        if (index >= 0) {
+            int start = Math.max(0, index - 120);
+            int end = Math.min(script.length(), index + 180);
+
+            System.out.println(
+                    "[JS PREPROCESSOR] Suspicious output after "
+                            + stage + ":\n"
+                            + script.substring(start, end)
+            );
+        }
     }
 }

@@ -11,7 +11,16 @@ import org.mozilla.javascript.NativeArray;
 import java.util.IdentityHashMap;
 import java.util.Map;
 
-public final class JsNode {
+public final class JsNode implements ExpandoHost {
+
+    // Script-assigned expando properties live here (shared by every Rhino wrapper of this node).
+    private final java.util.Map<String, Object> expandos =
+            java.util.Collections.synchronizedMap(new java.util.HashMap<>());
+
+    @Override
+    public java.util.Map<String, Object> expandoMap() {
+        return expandos;
+    }
 
     // Marks a synthetic container Element created by attachShadow() so we can
     // recognize it later (getShadowRoot(), isJsShadowRootNode()) without needing
@@ -546,6 +555,53 @@ public final class JsNode {
         return element.childNodeSize() > 0;
     }
 
+    /**
+     * Called after a node has been attached to this element. Dynamically added
+     * <script> elements must run (that's how loaders like reCAPTCHA's
+     * enterprise.js pull in their real code), and iframe insertions are logged
+     * so we can see what a page is trying to embed.
+     */
+    private void notifyInserted(Element inserted) {
+        if (inserted == null || inserted.ownerDocument() == null) {
+            return; // still detached from the live document
+        }
+        String tag = inserted.tagName();
+        if ("script".equalsIgnoreCase(tag)) {
+            ctx.scriptInserted(inserted);
+        } else if ("iframe".equalsIgnoreCase(tag)) {
+            org.tinylog.Logger.info("[DOM] iframe inserted: src={} attrs={}",
+                    inserted.attr("src"), inserted.attributes());
+        }
+    }
+
+    /** node.insertBefore(newNode, referenceNode) - a null reference appends. */
+    public JsNode insertBefore(JsNode newNode, JsNode referenceNode) {
+        if (newNode == null) {
+            return null;
+        }
+        if (referenceNode == null || referenceNode.element.parent() != element) {
+            return appendChild(newNode);
+        }
+
+        int index = referenceNode.element.siblingIndex();
+
+        if (newNode.isFakeTextNode()) {
+            String text = newNode.element.attr(TEXT_NODE_ATTR);
+            String tag = element.tagName();
+            Node textNode = ("style".equals(tag) || "script".equals(tag))
+                    ? new org.jsoup.nodes.DataNode(text)
+                    : new org.jsoup.nodes.TextNode(text);
+            element.insertChildren(index, textNode);
+            invalidate();
+            return newNode;
+        }
+
+        element.insertChildren(index, newNode.element);
+        invalidate();
+        notifyInserted(newNode.element);
+        return newNode;
+    }
+
     public JsNode appendChild(JsNode child) {
         if (child == null) {
             return null;
@@ -570,6 +626,7 @@ public final class JsNode {
 
         element.appendChild(child.element);
         invalidate();
+        notifyInserted(child.element);
 
         return child;
     }
@@ -937,6 +994,20 @@ public final class JsNode {
         public void clearCache() {
             cache.clear();
         }
+
+        // Called when a <script> element is attached to the live document after
+        // load (document.createElement('script') + insertBefore/appendChild/...).
+        private java.util.function.Consumer<Element> scriptInsertedListener;
+
+        public void setScriptInsertedListener(java.util.function.Consumer<Element> listener) {
+            this.scriptInsertedListener = listener;
+        }
+
+        void scriptInserted(Element script) {
+            if (scriptInsertedListener != null) {
+                scriptInsertedListener.accept(script);
+            }
+        }
     }
 
     // ============================================================
@@ -1069,6 +1140,7 @@ public final class JsNode {
                     any = true;
                 } else {
                     element.appendChild(jsNode.element);
+                    notifyInserted(jsNode.element);
                     any = true;
                 }
             } else if (node != null) {
@@ -1092,6 +1164,7 @@ public final class JsNode {
                     prependCssAwareText(text);
                 } else {
                     element.insertChildren(0, jsNode.element);
+                    notifyInserted(jsNode.element);
                 }
             } else if (node != null) {
                 prependCssAwareText(Context.toString(node));

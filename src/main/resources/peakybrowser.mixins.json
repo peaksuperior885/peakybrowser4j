@@ -1,0 +1,10 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "com.peak885.peakybrowser4jv2.browser.mixin",
+  "compatibilityLevel": "JAVA_11",
+  "mixins": [
+    "HttpManagerMixin",
+    "MixinAACDecoder"
+  ]
+}

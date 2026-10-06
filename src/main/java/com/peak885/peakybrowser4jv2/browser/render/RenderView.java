@@ -137,9 +137,15 @@ public final class RenderView
     /** Must be called on the EDT. Installs an already-built page (see {@link #buildLayout}) and repaints. */
     public void applyLoadedPage(LoadedPage page) {
         inputs.clearTextSelection();
+        JsBridge previousBridge = this.jsBridge;
         this.currentDocument = page.document();
         this.rootBox = page.rootBox();
         this.jsBridge = page.jsBridge();
+        // The page being replaced must stop running: its timers/intervals would otherwise
+        // keep firing against a document nobody can see.
+        if (previousBridge != null && previousBridge != page.jsBridge()) {
+            previousBridge.close();
+        }
         styleResolver.setHoveredElement(null);
         styleResolver.setActiveElement(null);
         styleResolver.setFocusedElement(null);
@@ -157,6 +163,9 @@ public final class RenderView
         inputs.clearTextSelection();
         rootBox = null;
         currentDocument = null;
+        if (jsBridge != null) {
+            jsBridge.close();
+        }
         jsBridge = null;
         isLayoutDirty = false;
         styleResolver.setHoveredElement(null);

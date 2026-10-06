@@ -231,6 +231,23 @@ public final class LayoutEngine {
 
             /*
              * ---------------------------------------------------------
+             * VIDEO
+             * ---------------------------------------------------------
+             */
+            if ("video".equals(tag)) {
+
+                renderVideo(
+                        element,
+                        style,
+                        href,
+                        collector
+                );
+
+                continue;
+            }
+
+            /*
+             * ---------------------------------------------------------
              * ABSOLUTE / FIXED
              * ---------------------------------------------------------
              */
@@ -754,5 +771,28 @@ public final class LayoutEngine {
                 new ArrayList<>();
 
         boolean pendingSpace;
+    }
+
+    private void renderVideo(
+            Element element,
+            ComputedStyle style,
+            String href,
+            InlineCollector collector
+    ) {
+        VideoBox videoBox = new VideoBox(
+                style,
+                element,
+                browserLoader
+        );
+
+        collector.buffer.add(
+                InlineBox.inlineBlock(
+                        style,
+                        videoBox,
+                        href
+                )
+        );
+
+        collector.pendingSpace = false;
     }
 }

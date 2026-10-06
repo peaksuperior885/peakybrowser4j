@@ -224,7 +224,7 @@ public final class BrowserLoader {
             return false;
         }
 
-        // Everything else (pdf, zip, octet-stream, video, audio, …)
+        // Everything else (pdf, zip, octet-stream, video, media, …)
         return true;
     }
 

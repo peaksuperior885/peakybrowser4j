@@ -3,13 +3,9 @@ package com.peak885.peakybrowser4jv2.browser.http;
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.peak885.peakybrowser4jv2.browser.cookiemonster.BiscuitJarAdapter;
-import com.peak885.peakybrowser4jv2.browser.cookiemonster.SQLiteBiscuitJar;
-import okhttp3.CacheControl;
-import okhttp3.Headers;
-import okhttp3.OkHttpClient;
-import okhttp3.Request;
-import okhttp3.Response;
-import okhttp3.ResponseBody;
+import com.peak885.peakybrowser4jv2.browser.cookiemonster.JsonBiscuitJar;
+import okhttp3.*;
+
 import java.net.MalformedURLException;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
@@ -21,10 +17,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.sql.SQLException;
 import java.time.Duration;
-import java.util.Collections;
-import java.util.LinkedHashMap;
-import java.util.Locale;
-import java.util.Map;
+import java.util.*;
 import java.util.concurrent.TimeUnit;
 
 public final class HttpManager {
@@ -64,7 +57,7 @@ public final class HttpManager {
 
     private final Cache<String, HttpResponse> memoryCache;
 
-    private final SQLiteBiscuitJar biscuitJar;
+    private final JsonBiscuitJar biscuitJar;
 
     public HttpManager() {
 
@@ -92,9 +85,9 @@ public final class HttpManager {
                     "cookies.sqlite"
             );
 
-            this.biscuitJar = new SQLiteBiscuitJar(cookieDatabase);
+            this.biscuitJar = new JsonBiscuitJar(cookieDatabase);
 
-        } catch (SQLException | IOException e) {
+        } catch (IOException e) {
 
             throw new IllegalStateException(
                     "Failed to initialize cookie database",
@@ -128,6 +121,7 @@ public final class HttpManager {
          * BiscuitJar handles persistent browser cookies.
          */
         this.client = new OkHttpClient.Builder()
+                .protocols(Arrays.asList(Protocol.HTTP_2, Protocol.HTTP_1_1))
                 .followRedirects(true)
                 .followSslRedirects(true)
 
@@ -379,28 +373,21 @@ public final class HttpManager {
                 url
         );
 
-        Request request =
-                new Request.Builder()
-                        .url(url)
-                        .get()
-
-                        .header(
-                                "User-Agent",
-                                USER_AGENT
-                        )
-
-                        .header(
-                                "Accept",
-                                accept
-                        )
-
-                        .header(
-                                "Accept-Language",
-                                "en-US,en;q=0.9"
-                        )
-
-                        .build();
-
+        Request request = new Request.Builder()
+                .url(url)
+                .get()
+                .header("User-Agent", USER_AGENT)
+                .header("Accept", accept)
+                .header("Accept-Language", "en-US,en;q=0.9")
+                // NOTE: no manual Accept-Encoding here. Setting it ourselves makes OkHttp
+                // skip its transparent gzip decoding (and it can't decode br/deflate), so
+                // scripts/CSS arrived as compressed garbage. Without it OkHttp sends
+                // "gzip" and decodes the body for us.
+                .header("Sec-Fetch-Dest", "document")
+                .header("Sec-Fetch-Mode", "navigate")
+                .header("Sec-Fetch-Site", "none")
+                .header("Sec-Fetch-User", "?1")
+                .build();
         /*
          * Layer 2:
          *
@@ -875,6 +862,20 @@ public final class HttpManager {
         );
 
         Response response = client.newCall(request).execute();
+
+        Logger.info(
+                "[HTTP] Streaming {} {}",
+                request.method(),
+                request.url()
+        );
+
+        for (String name : request.headers().names()) {
+            Logger.info(
+                    "[HTTP] Streaming request header: {}: {}",
+                    name,
+                    request.header(name)
+            );
+        }
 
         Logger.info(
                 "[HTTP] Streaming response: {} {}",

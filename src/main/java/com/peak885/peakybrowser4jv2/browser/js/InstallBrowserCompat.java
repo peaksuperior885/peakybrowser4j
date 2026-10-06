@@ -13,6 +13,7 @@ public final class InstallBrowserCompat {
         installTimers(cx, scope);
         installPromises(cx, scope);
         installFetchCompatibility(cx, scope);
+        installXMLHttpRequest(cx, scope);
         installWindowEvents(cx, scope);
         installObservers(cx, scope);
         installMiscellaneous(cx, scope);
@@ -1098,6 +1099,211 @@ public final class InstallBrowserCompat {
         );
     }
 
+
+    // ---------------------------------------------------------------------
+    // XMLHttpRequest
+    // ---------------------------------------------------------------------
+
+    /**
+     * Minimal XMLHttpRequest polyfill.
+     *
+     * Network work is delegated to the Java-side {@code __nativeXhrSend}
+     * installed by {@code JsBridge}, which uses {@code HttpManager}.
+     * That keeps cookie handling, UA, and caching consistent with fetch().
+     */
+    private void installXMLHttpRequest(Context cx, Scriptable scope) {
+        String source = """
+            if (typeof XMLHttpRequest === 'undefined') {
+
+                function XMLHttpRequest() {
+                    this.readyState = 0;
+                    this.status = 0;
+                    this.statusText = '';
+                    this.responseText = '';
+                    this.response = '';
+                    this.responseType = '';
+                    this.responseURL = '';
+                    this.withCredentials = false;
+                    this.timeout = 0;
+
+                    this.onreadystatechange = null;
+                    this.onload = null;
+                    this.onerror = null;
+                    this.onloadend = null;
+                    this.ontimeout = null;
+                    this.onabort = null;
+                    this.onprogress = null;
+
+                    this._method = 'GET';
+                    this._url = '';
+                    this._async = true;
+                    this._headers = {};
+                    this._aborted = false;
+                    this._sent = false;
+                    this._requestHeaders = {};
+                    this._responseHeaders = {};
+                }
+
+                XMLHttpRequest.UNSENT = 0;
+                XMLHttpRequest.OPENED = 1;
+                XMLHttpRequest.HEADERS_RECEIVED = 2;
+                XMLHttpRequest.LOADING = 3;
+                XMLHttpRequest.DONE = 4;
+
+                XMLHttpRequest.prototype.UNSENT = 0;
+                XMLHttpRequest.prototype.OPENED = 1;
+                XMLHttpRequest.prototype.HEADERS_RECEIVED = 2;
+                XMLHttpRequest.prototype.LOADING = 3;
+                XMLHttpRequest.prototype.DONE = 4;
+
+                XMLHttpRequest.prototype._setReadyState = function(state) {
+                    this.readyState = state;
+                    if (typeof this.onreadystatechange === 'function') {
+                        try { this.onreadystatechange(); } catch (e) {}
+                    }
+                };
+
+                XMLHttpRequest.prototype.open = function(method, url, async, user, password) {
+                    if (method == null || url == null) {
+                        throw new TypeError('Failed to execute \\'open\\' on \\'XMLHttpRequest\\': 2 arguments required');
+                    }
+                    this._method = String(method).toUpperCase();
+                    this._url = String(url);
+                    this._async = async !== false;
+                    this._aborted = false;
+                    this._sent = false;
+                    this._headers = {};
+                    this._requestHeaders = {};
+                    this._responseHeaders = {};
+                    this.status = 0;
+                    this.statusText = '';
+                    this.responseText = '';
+                    this.response = '';
+                    this.responseURL = '';
+                    this._setReadyState(XMLHttpRequest.OPENED);
+                };
+
+                XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
+                    if (this.readyState !== XMLHttpRequest.OPENED || this._sent) {
+                        throw new Error('Failed to execute \\'setRequestHeader\\' on \\'XMLHttpRequest\\': The object\\'s state must be OPENED.');
+                    }
+                    if (name == null) return;
+                    var key = String(name);
+                    var lower = key.toLowerCase();
+                    // Forbidden headers are ignored (browser behaviour)
+                    if (lower === 'host' || lower === 'content-length' || lower === 'connection') {
+                        return;
+                    }
+                    if (this._requestHeaders[lower] != null) {
+                        this._requestHeaders[lower] = this._requestHeaders[lower] + ', ' + String(value);
+                    } else {
+                        this._requestHeaders[lower] = String(value);
+                    }
+                    this._headers[key] = this._requestHeaders[lower];
+                };
+
+                XMLHttpRequest.prototype.getAllResponseHeaders = function() {
+                    var lines = [];
+                    var keys = Object.keys(this._responseHeaders || {});
+                    for (var i = 0; i < keys.length; i++) {
+                        lines.push(keys[i] + ': ' + this._responseHeaders[keys[i]]);
+                    }
+                    return lines.join('\\r\\n');
+                };
+
+                XMLHttpRequest.prototype.getResponseHeader = function(name) {
+                    if (name == null) return null;
+                    var value = this._responseHeaders[String(name).toLowerCase()];
+                    return value === undefined ? null : value;
+                };
+
+                XMLHttpRequest.prototype.abort = function() {
+                    this._aborted = true;
+                    if (this.readyState !== XMLHttpRequest.UNSENT &&
+                        this.readyState !== XMLHttpRequest.DONE) {
+                        this._setReadyState(XMLHttpRequest.DONE);
+                        if (typeof this.onabort === 'function') {
+                            try { this.onabort(); } catch (e) {}
+                        }
+                        if (typeof this.onloadend === 'function') {
+                            try { this.onloadend(); } catch (e) {}
+                        }
+                    }
+                    this.readyState = XMLHttpRequest.UNSENT;
+                };
+
+                XMLHttpRequest.prototype.overrideMimeType = function(mime) {
+                    this._overrideMime = mime != null ? String(mime) : null;
+                };
+
+                XMLHttpRequest.prototype.send = function(body) {
+                    if (this.readyState !== XMLHttpRequest.OPENED || this._sent) {
+                        throw new Error('Failed to execute \\'send\\' on \\'XMLHttpRequest\\': The object\\'s state must be OPENED.');
+                    }
+                    if (typeof __nativeXhrSend !== 'function') {
+                        throw new Error('XMLHttpRequest: native transport (__nativeXhrSend) is not available');
+                    }
+
+                    this._sent = true;
+                    this._aborted = false;
+
+                    var self = this;
+                    var method = this._method;
+                    var url = this._url;
+                    var headers = this._requestHeaders;
+                    var payload = body == null ? null : String(body);
+
+                    // HEADERS_RECEIVED will be set when the native side responds;
+                    // mark that the request has left the client.
+                    this._setReadyState(XMLHttpRequest.HEADERS_RECEIVED);
+
+                    var onSuccess = function(status, statusText, responseText, responseURL, responseHeaders) {
+                        if (self._aborted) return;
+                        self.status = status | 0;
+                        self.statusText = statusText == null ? '' : String(statusText);
+                        self.responseText = responseText == null ? '' : String(responseText);
+                        self.response = self.responseText;
+                        self.responseURL = responseURL == null ? '' : String(responseURL);
+                        self._responseHeaders = responseHeaders || {};
+                        self._setReadyState(XMLHttpRequest.LOADING);
+                        self._setReadyState(XMLHttpRequest.DONE);
+                        if (typeof self.onload === 'function') {
+                            try { self.onload(); } catch (e) {}
+                        }
+                        if (typeof self.onloadend === 'function') {
+                            try { self.onloadend(); } catch (e) {}
+                        }
+                    };
+
+                    var onError = function(message) {
+                        if (self._aborted) return;
+                        self.status = 0;
+                        self.statusText = '';
+                        self.responseText = '';
+                        self.response = '';
+                        self._setReadyState(XMLHttpRequest.DONE);
+                        if (typeof self.onerror === 'function') {
+                            try { self.onerror(message); } catch (e) {}
+                        }
+                        if (typeof self.onloadend === 'function') {
+                            try { self.onloadend(); } catch (e) {}
+                        }
+                    };
+
+                    __nativeXhrSend(method, url, headers, payload, onSuccess, onError);
+                };
+            }
+            """;
+
+        cx.evaluateString(
+                scope,
+                source,
+                "browser-xhr",
+                1,
+                null
+        );
+    }
+
     private void installExceptionHandling(Context cx, Scriptable scope) {
         String source = """
     if (typeof __browserDumpException !== 'function') {
@@ -1134,6 +1340,50 @@ public final class InstallBrowserCompat {
 
     public static void installClosureCompat(Scriptable scope) {
         String script = """
+        // Rhino + Closure Compiler compatibility
+        (function() {
+            var slice = Array.prototype.slice;
+
+            function compatBind(oThis) {
+                if (typeof this !== 'function') {
+                    throw new TypeError(
+                        'Function.prototype.bind - not callable'
+                    );
+                }
+
+                var aArgs = slice.call(arguments, 1);
+                var fToBind = this;
+                var fNOP = function() {};
+
+                var fBound = function() {
+                    return fToBind.apply(
+                        this instanceof fNOP ? this : oThis,
+                        aArgs.concat(slice.call(arguments))
+                    );
+                };
+
+                if (fToBind.prototype) {
+                    fNOP.prototype = fToBind.prototype;
+                    fBound.prototype = new fNOP();
+                }
+
+                fBound.displayName =
+                    'bound ' + (fToBind.name || 'anonymous');
+
+                return fBound;
+            }
+
+            // Normal JavaScript functions.
+            Function.prototype.bind = compatBind;
+
+            // Some Closure/Rhino callable objects do not inherit from
+            // Function.prototype. Give those objects the same fallback.
+            if (typeof Object.prototype.bind !== 'function') {
+                Object.prototype.bind = compatBind;
+            }
+        })();
+
+        // Closure Compiler helpers
         if (typeof $jscomp === 'undefined') {
             var $jscomp = {};
         }
@@ -1150,7 +1400,7 @@ public final class InstallBrowserCompat {
                 if (iterable == null) {
                     return {
                         next: function() {
-                            return {done: true};
+                            return { done: true };
                         }
                     };
                 }
@@ -1160,7 +1410,7 @@ public final class InstallBrowserCompat {
                 return {
                     next: function() {
                         if (index >= iterable.length) {
-                            return {done: true};
+                            return { done: true };
                         }
 
                         return {
@@ -1171,9 +1421,16 @@ public final class InstallBrowserCompat {
                 };
             };
         }
-    """;
+        """;
 
         Context context = Context.getCurrentContext();
-        context.evaluateString(scope, script, "closure-compat", 1, null);
+
+        context.evaluateString(
+                scope,
+                script,
+                "closure-compat",
+                1,
+                null
+        );
     }
 }
