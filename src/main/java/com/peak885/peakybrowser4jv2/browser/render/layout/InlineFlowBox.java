@@ -99,9 +99,28 @@ public final class InlineFlowBox extends Box {
                 float cssWidth = resolveCssWidth(token, width);
                 float cssHeight = resolveCssHeight(token, width);
 
-                float layoutWidth = cssWidth > 0
-                        ? cssWidth
-                        : width;
+                float layoutWidth;
+                if (cssWidth > 0) {
+                    layoutWidth = cssWidth;
+                } else {
+                    // Shrink-to-fit for width:auto inline-block (CSS 2.1 §10.3.9).
+                    // Previously we always passed the full line width, which made
+                    // backgrounds (e.g. .text-highlight) stretch to the entire
+                    // line instead of hugging the content.
+                    float preferred = 0f;
+                    if (child instanceof InlineFlowBox flow) {
+                        preferred = flow.intrinsicWidth();
+                    }
+                    if (preferred <= 0f) {
+                        // Measure unconstrained, then re-layout with the real width.
+                        child.layout(1_000_000f, 0, 0);
+                        preferred = child.getBorderBoxWidth();
+                    }
+                    layoutWidth = Math.min(Math.max(preferred, 0f), width);
+                    if (layoutWidth <= 0f) {
+                        layoutWidth = width;
+                    }
+                }
 
                 child.layout(
                         layoutWidth,
@@ -134,20 +153,9 @@ public final class InlineFlowBox extends Box {
              */
             else if (token.isImage()) {
 
-                if (token.image() == null) {
-                    continue;
-                }
-
-                float intrinsicWidth =
-                        token.image().intrinsicWidth();
-
-                float intrinsicHeight =
-                        token.image().intrinsicHeight();
-
-                if (intrinsicWidth <= 0
-                        || intrinsicHeight <= 0) {
-                    continue;
-                }
+                var image = token.image();
+                float intrinsicWidth = image == null ? 16f : image.intrinsicWidth();
+                float intrinsicHeight = image == null ? 16f : image.intrinsicHeight();
 
                 float cssWidth = token.style.width(
                         -1f,
@@ -273,8 +281,11 @@ public final class InlineFlowBox extends Box {
              * ------------------------------------------------------------
              * WRAPPING
              * ------------------------------------------------------------
+             * Respect white-space: pre / nowrap — no soft wraps.
+             * pre-wrap / pre-line / normal still wrap when the line is full.
              */
             if (!startOfLine
+                    && style.allowsSoftWrap()
                     && cursorX + requiredWidth > contentRight) {
 
                 lineTop = closeLine(

@@ -284,30 +284,35 @@ public final class JsDocument implements ExpandoHost {
         this(document, ctx, new AtomicReference<>());
     }
 
-    public JsDocument(Document document, JsNode.Ctx ctx, AtomicReference<Element> currentScriptRef) {
+    public JsDocument(
+            Document document,
+            JsNode.Ctx ctx,
+            AtomicReference<Element> currentScriptRef
+    ) {
         this.document = document;
         this.ctx = ctx;
         this.currentScriptRef = currentScriptRef;
+
+        // Register this document as the DOM document belonging to this JS context.
+        this.ctx.setDocument(this);
     }
 
     /** document.getElementsByTagName — several challenge/bootstrap scripts (e.g. Cloudflare's)
      *  reach for this directly on `document` before ever touching an element. */
     public Object getElementsByTagName(String tagName) {
         if (tagName == null || tagName.isBlank()) {
-            return new NativeArray(0);
+            return ctx.toJsNodeArray(new JsNode[0]);
         }
 
         Elements elements = "*".equals(tagName)
                 ? document.getAllElements()
                 : document.getElementsByTag(tagName);
 
-        Object[] nodes = new Object[elements.size()];
-
+        JsNode[] nodes = new JsNode[elements.size()];
         for (int i = 0; i < elements.size(); i++) {
             nodes[i] = ctx.wrap(elements.get(i));
         }
-
-        return new NativeArray(nodes);
+        return ctx.toJsNodeArray(nodes);
     }
 
     /** document.currentScript — set while executeInlineScripts() is running a given <script>. */
@@ -364,18 +369,16 @@ public final class JsDocument implements ExpandoHost {
 
     public Object querySelectorAll(String selector) {
         if (selector == null || selector.isBlank()) {
-            return new NativeArray(0);
+            return ctx.toJsNodeArray(new JsNode[0]);
         }
 
         Elements elements = document.select(selector);
 
-        Object[] nodes = new Object[elements.size()];
-
+        JsNode[] nodes = new JsNode[elements.size()];
         for (int i = 0; i < elements.size(); i++) {
             nodes[i] = ctx.wrap(elements.get(i));
         }
-
-        return new NativeArray(nodes);
+        return ctx.toJsNodeArray(nodes);
     }
 
     public JsNode createElement(String tagName) {
@@ -473,6 +476,46 @@ public final class JsDocument implements ExpandoHost {
         }
     }
 
+    // document.readyState: "loading" while inline scripts run, "interactive" around
+    // DOMContentLoaded, "complete" once the load event has fired. Scripts such as
+    // reCAPTCHA's loader branch on this ("render now if complete, else wait for load").
+    private volatile String readyState = "loading";
+
+    public String getReadyState() {
+        return readyState;
+    }
+
+    void setReadyState(String state) {
+        if (state == null || state.equals(readyState)) {
+            return;
+        }
+        readyState = state;
+        dispatchEvent("readystatechange", null);
+    }
+
+    /** document.getElementsByClassName - needed by auto-render scripts (e.g. .g-recaptcha). */
+    public Object getElementsByClassName(String classNames) {
+        if (classNames == null || classNames.isBlank()) {
+            return ctx.toJsNodeArray(new JsNode[0]);
+        }
+        StringBuilder selector = new StringBuilder();
+        for (String name : classNames.trim().split("\\s+")) {
+            selector.append('.');
+            for (int i = 0; i < name.length(); i++) {
+                char c = name.charAt(i);
+                if (!(Character.isLetterOrDigit(c) || c == '-' || c == '_')) {
+                    selector.append('\\');
+                }
+                selector.append(c);
+            }
+        }
+        try {
+            return querySelectorAll(selector.toString());
+        } catch (RuntimeException e) {
+            return ctx.toJsNodeArray(new JsNode[0]);
+        }
+    }
+
     public void dispatchDOMContentLoaded() {
         dispatchEvent("DOMContentLoaded", null);
     }
@@ -485,6 +528,10 @@ public final class JsDocument implements ExpandoHost {
      */
     public Object getFonts() {
         return fontsStub;
+    }
+
+    public Object getDefaultView() {
+        return ctx.getGlobalScope();
     }
 
     /** Lazily built FontFaceSet-compatible stub (set by JsBridge after init). */

@@ -42,6 +42,8 @@ public final class RenderView
     private boolean isLayoutDirty = false;
     private boolean relayoutInFlight = false;
     private final Timer layoutBatchTimer;
+    /** Drives CSS transition frames (~60fps) while hover/active anims run. */
+    private Timer animationTimer;
 
     public RenderView(BrowserLoader browserLoader) {
 
@@ -50,6 +52,7 @@ public final class RenderView
                         styleResolver,
                         browserLoader
                 );
+        layoutEngine.setPipelineInvalidator(this::invalidateLayout);
 
         setBackground(Color.WHITE);
         setOpaque(true);
@@ -66,6 +69,21 @@ public final class RenderView
         layoutBatchTimer.setRepeats(true);
         layoutBatchTimer.start();
 
+        animationTimer = new Timer(16, e -> {
+            if (rootBox == null) {
+                animationTimer.stop();
+                return;
+            }
+            long now = System.currentTimeMillis();
+            if (rootBox.hasRunningAnimation(now)) {
+                repaint();
+            } else {
+                animationTimer.stop();
+                repaint(); // final frame at rest style
+            }
+        });
+        animationTimer.setRepeats(true);
+
         // Inputs owns all mouse/keyboard handling for this surface: link
         // hover/navigation, and dispatching real "click"/"keydown"/"keyup"
         // DOM events into whatever page script is currently loaded.
@@ -81,7 +99,8 @@ public final class RenderView
     /**
      * Updates StyleResolver interaction targets and re-resolves styles on
      * the existing box tree so :hover / :active / :focus rules take effect
-     * without a full layout rebuild.
+     * without a full layout rebuild. Starts the animation timer when any
+     * box begins a CSS transition.
      */
     private void restyleForInteraction() {
         if (rootBox == null) {
@@ -95,6 +114,11 @@ public final class RenderView
         );
         layoutEngine.restyle(rootBox);
         repaint();
+        if (rootBox.hasRunningAnimation(System.currentTimeMillis())) {
+            if (!animationTimer.isRunning()) {
+                animationTimer.start();
+            }
+        }
     }
 
     public void setOnNavigate(

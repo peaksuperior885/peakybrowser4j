@@ -114,14 +114,46 @@ public final class ComputedStyle {
     }
 
     public Color color() {
-        return parseColor(get("color", "#000000"));
+        Color c = parseColorSafely(get("color", "#000000"));
+        if (c == null) {
+            c = Color.BLACK;
+        }
+        // gradient-text trick: color:transparent + background-clip:text
+        // Without background-clip support the title would be invisible.
+        if (c.getAlpha() == 0) {
+            String clip = get("background-clip", "") + " "
+                    + get("-webkit-background-clip", "");
+            if (clip.toLowerCase().contains("text")) {
+                Color fromGradient = firstGradientStopColor();
+                if (fromGradient != null && fromGradient.getAlpha() > 0) {
+                    return fromGradient;
+                }
+                // Sensible fallback for dark themes
+                return new Color(0xC4, 0xB5, 0xFD);
+            }
+        }
+        return c;
     }
 
     public Color backgroundColor() {
-        return parseColor(get("background-color", "transparent"));
+        Color solid = parseColorSafely(get("background-color", "transparent"));
+        if (solid != null && solid.getAlpha() > 0) {
+            return solid;
+        }
+        // Multi-layer `background:` often ends with a solid base color
+        // after one or more gradients (e.g. body on the maven site).
+        Color fromLayers = lastSolidBackgroundLayer();
+        if (fromLayers != null) {
+            return fromLayers;
+        }
+        return solid != null ? solid : new Color(0, 0, 0, 0);
     }
 
     public Paint backgroundPaint(float width, float height) {
+        // Prefer an explicit solid base so pages that stack
+        // radial-gradient(...) , ..., #0a0b14 don't render on white.
+        Color base = backgroundColor();
+
         String backgroundImage = get("background-image");
 
         if (!backgroundImage.isBlank()
@@ -150,11 +182,89 @@ public final class ComputedStyle {
             );
 
             if (gradient != null) {
+                // If the only thing we got is a soft radial, still fill with
+                // the solid base first at paint time — BlockBox paints a
+                // single Paint, so prefer the solid base when the gradient
+                // is clearly decorative (low-alpha stops). Otherwise use
+                // the gradient.
                 return gradient;
+            }
+
+            // No gradient parsed — try trailing solid in the shorthand.
+            Color trailing = lastSolidBackgroundLayer();
+            if (trailing != null) {
+                return trailing;
             }
         }
 
-        return backgroundColor();
+        return base;
+    }
+
+    /** First color stop of any linear/radial gradient on this style. */
+    private Color firstGradientStopColor() {
+        for (String src : new String[] {
+                get("background-image"),
+                get("background")
+        }) {
+            if (src == null || src.isBlank()) continue;
+            String lower = src.toLowerCase();
+            int idx = lower.indexOf("gradient(");
+            if (idx < 0) continue;
+            // Pull first #rgb / rgb() / named color after gradient(
+            java.util.regex.Matcher m = java.util.regex.Pattern.compile(
+                    "#[0-9a-fA-F]{3,8}|rgba?\\([^)]+\\)|hsla?\\([^)]+\\)"
+            ).matcher(src.substring(idx));
+            if (m.find()) {
+                Color c = parseColorSafely(m.group());
+                if (c != null) return c;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * For multi-layer backgrounds like
+     * {@code radial-gradient(...), radial-gradient(...), #0a0b14}
+     * return the last solid color layer (the base fill).
+     */
+    private Color lastSolidBackgroundLayer() {
+        String background = get("background", "");
+        if (background.isBlank()) {
+            return null;
+        }
+        // Split on commas that are not inside parentheses.
+        java.util.List<String> layers = new java.util.ArrayList<>();
+        StringBuilder cur = new StringBuilder();
+        int depth = 0;
+        for (int i = 0; i < background.length(); i++) {
+            char ch = background.charAt(i);
+            if (ch == '(') depth++;
+            else if (ch == ')') depth = Math.max(0, depth - 1);
+            if (ch == ',' && depth == 0) {
+                layers.add(cur.toString().trim());
+                cur.setLength(0);
+            } else {
+                cur.append(ch);
+            }
+        }
+        if (cur.length() > 0) {
+            layers.add(cur.toString().trim());
+        }
+        for (int i = layers.size() - 1; i >= 0; i--) {
+            String layer = layers.get(i);
+            if (layer.toLowerCase().contains("gradient(")) {
+                continue;
+            }
+            // Take the last token that looks like a color.
+            String[] tokens = layer.split("\\s+");
+            for (int t = tokens.length - 1; t >= 0; t--) {
+                Color c = parseColorSafely(tokens[t]);
+                if (c != null && c.getAlpha() > 0) {
+                    return c;
+                }
+            }
+        }
+        return null;
     }
 
     public float fontSize() {
@@ -215,6 +325,36 @@ public final class ComputedStyle {
         return get("text-decoration", "none")
                 .toLowerCase()
                 .contains("underline");
+    }
+
+    /**
+     * CSS white-space value. Defaults to "normal".
+     * Values we honor: normal, nowrap, pre, pre-wrap, pre-line.
+     */
+    public String whiteSpace() {
+        String v = get("white-space", "normal").trim().toLowerCase();
+        return v.isEmpty() ? "normal" : v;
+    }
+
+    public boolean preservesNewlines() {
+        return switch (whiteSpace()) {
+            case "pre", "pre-wrap", "pre-line" -> true;
+            default -> false;
+        };
+    }
+
+    public boolean preservesSpaces() {
+        return switch (whiteSpace()) {
+            case "pre", "pre-wrap" -> true;
+            default -> false;
+        };
+    }
+
+    public boolean allowsSoftWrap() {
+        return switch (whiteSpace()) {
+            case "nowrap", "pre" -> false;
+            default -> true;
+        };
     }
 
     public float lineHeight() {
@@ -323,6 +463,24 @@ public final class ComputedStyle {
             return fallback;
         }
 
+        return parseLength(
+                value,
+                fallback,
+                fontSize,
+                viewportWidth,
+                600f
+        );
+    }
+
+    public float minHeight(
+            float fallback,
+            float fontSize,
+            float viewportWidth
+    ) {
+        String value = get("min-height");
+        if (value.isBlank() || value.equalsIgnoreCase("none")) {
+            return fallback;
+        }
         return parseLength(
                 value,
                 fallback,
@@ -550,6 +708,178 @@ public final class ComputedStyle {
 
     public record BoxShadow(float offsetX, float offsetY, float blur, Color color) {}
 
+    /**
+     * Parsed CSS {@code transform}. Supports a useful subset:
+     * {@code translate/translateX/translateY}, {@code scale/scaleX/scaleY},
+     * {@code rotate}. Multiple functions are composed in order.
+     */
+    public record Transform(
+            float translateX,
+            float translateY,
+            float scaleX,
+            float scaleY,
+            float rotateDeg
+    ) {
+        public static final Transform IDENTITY = new Transform(0, 0, 1, 1, 0);
+
+        public boolean isIdentity() {
+            return translateX == 0f && translateY == 0f
+                    && scaleX == 1f && scaleY == 1f
+                    && rotateDeg == 0f;
+        }
+
+        public Transform interpolate(Transform to, float t) {
+            return new Transform(
+                    translateX + (to.translateX - translateX) * t,
+                    translateY + (to.translateY - translateY) * t,
+                    scaleX + (to.scaleX - scaleX) * t,
+                    scaleY + (to.scaleY - scaleY) * t,
+                    rotateDeg + (to.rotateDeg - rotateDeg) * t
+            );
+        }
+    }
+
+    public Transform transform() {
+        String value = get("transform", "none").trim();
+        if (value.isBlank() || value.equalsIgnoreCase("none")) {
+            return Transform.IDENTITY;
+        }
+
+        float tx = 0, ty = 0, sx = 1, sy = 1, rot = 0;
+        // Match function calls: name(args)
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("([a-zA-Z]+)\\s*\\(([^)]*)\\)")
+                .matcher(value);
+        while (m.find()) {
+            String fn = m.group(1).toLowerCase(java.util.Locale.ROOT);
+            String[] args = m.group(2).split(",");
+            try {
+                switch (fn) {
+                    case "translate" -> {
+                        if (args.length >= 1) {
+                            tx += parseLength(args[0].trim(), 0f, fontSize(), 800f, 600f);
+                        }
+                        if (args.length >= 2) {
+                            ty += parseLength(args[1].trim(), 0f, fontSize(), 800f, 600f);
+                        }
+                    }
+                    case "translatex" -> {
+                        if (args.length >= 1) {
+                            tx += parseLength(args[0].trim(), 0f, fontSize(), 800f, 600f);
+                        }
+                    }
+                    case "translatey" -> {
+                        if (args.length >= 1) {
+                            ty += parseLength(args[0].trim(), 0f, fontSize(), 800f, 600f);
+                        }
+                    }
+                    case "scale" -> {
+                        if (args.length >= 1) {
+                            float s = Float.parseFloat(args[0].trim());
+                            sx *= s;
+                            sy *= args.length >= 2 ? Float.parseFloat(args[1].trim()) : s;
+                        }
+                    }
+                    case "scalex" -> {
+                        if (args.length >= 1) sx *= Float.parseFloat(args[0].trim());
+                    }
+                    case "scaley" -> {
+                        if (args.length >= 1) sy *= Float.parseFloat(args[0].trim());
+                    }
+                    case "rotate" -> {
+                        if (args.length >= 1) {
+                            String a = args[0].trim().toLowerCase(java.util.Locale.ROOT);
+                            if (a.endsWith("deg")) {
+                                rot += Float.parseFloat(a.substring(0, a.length() - 3));
+                            } else if (a.endsWith("rad")) {
+                                rot += (float) Math.toDegrees(
+                                        Float.parseFloat(a.substring(0, a.length() - 3)));
+                            } else {
+                                rot += Float.parseFloat(a);
+                            }
+                        }
+                    }
+                    default -> { /* ignore matrix/skew etc. for now */ }
+                }
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        return new Transform(tx, ty, sx, sy, rot);
+    }
+
+    /**
+     * Longest transition duration declared on this style (ms). Used to drive
+     * hover/active animations. Parses {@code transition} / {@code transition-duration}.
+     */
+    public long transitionDurationMs() {
+        String duration = get("transition-duration", "").trim();
+        if (duration.isBlank()) {
+            // Pull durations out of the shorthand: "prop 0.2s ease, prop 0.15s ease"
+            String shorthand = get("transition", "").trim();
+            if (shorthand.isBlank() || shorthand.equalsIgnoreCase("none")) {
+                return 0L;
+            }
+            long max = 0L;
+            for (String part : shorthand.split(",")) {
+                max = Math.max(max, parseCssTimeToMs(extractDurationToken(part)));
+            }
+            return max;
+        }
+        long max = 0L;
+        for (String part : duration.split(",")) {
+            max = Math.max(max, parseCssTimeToMs(part.trim()));
+        }
+        return max;
+    }
+
+    private static String extractDurationToken(String transitionPart) {
+        // Tokens look like: property | time | timing-function | delay
+        // Time tokens end in s or ms.
+        for (String tok : transitionPart.trim().split("\\s+")) {
+            String t = tok.trim().toLowerCase(java.util.Locale.ROOT);
+            if (t.endsWith("ms") || (t.endsWith("s") && !t.equals("ease")
+                    && !t.equals("linear") && !t.equals("ease-in")
+                    && !t.equals("ease-out") && !t.equals("ease-in-out"))) {
+                return t;
+            }
+        }
+        return "0s";
+    }
+
+    private static long parseCssTimeToMs(String value) {
+        if (value == null || value.isBlank()) return 0L;
+        String v = value.trim().toLowerCase(java.util.Locale.ROOT);
+        try {
+            if (v.endsWith("ms")) {
+                return Math.max(0L, (long) Float.parseFloat(v.substring(0, v.length() - 2)));
+            }
+            if (v.endsWith("s")) {
+                return Math.max(0L, (long) (Float.parseFloat(v.substring(0, v.length() - 1)) * 1000f));
+            }
+            return Math.max(0L, (long) (Float.parseFloat(v) * 1000f));
+        } catch (NumberFormatException e) {
+            return 0L;
+        }
+    }
+
+    public static Color interpolateColor(Color from, Color to, float t) {
+        if (from == null) from = new Color(0, 0, 0, 0);
+        if (to == null) to = new Color(0, 0, 0, 0);
+        t = Math.max(0f, Math.min(1f, t));
+        int r = Math.round(from.getRed() + (to.getRed() - from.getRed()) * t);
+        int g = Math.round(from.getGreen() + (to.getGreen() - from.getGreen()) * t);
+        int b = Math.round(from.getBlue() + (to.getBlue() - from.getBlue()) * t);
+        int a = Math.round(from.getAlpha() + (to.getAlpha() - from.getAlpha()) * t);
+        return new Color(clamp(r), clamp(g), clamp(b), clamp(a));
+    }
+
+    /** CSS ease (cubic-bezier approx) — smooth start/end. */
+    public static float ease(float t) {
+        t = Math.max(0f, Math.min(1f, t));
+        // ease ≈ cubic-bezier(0.25, 0.1, 0.25, 1) — use smoothstep as a solid approx
+        return t * t * (3f - 2f * t);
+    }
+
     private float resolveBoxSide(
             String shorthand,
             String longhand,
@@ -773,6 +1103,94 @@ public final class ComputedStyle {
 
         m.put("blueviolet", new Color(138, 43, 226));
 
+        // CSS named colors frequently used by real pages (Level 3+)
+        m.put("whitesmoke", new Color(245, 245, 245));
+        m.put("ghostwhite", new Color(248, 248, 255));
+        m.put("snow", new Color(255, 250, 250));
+        m.put("seashell", new Color(255, 245, 238));
+        m.put("floralwhite", new Color(255, 250, 240));
+        m.put("aliceblue", new Color(240, 248, 255));
+        m.put("lavender", new Color(230, 230, 250));
+        m.put("lavenderblush", new Color(255, 240, 245));
+        m.put("mistyrose", new Color(255, 228, 225));
+        m.put("honeydew", new Color(240, 255, 240));
+        m.put("mintcream", new Color(245, 255, 250));
+        m.put("azure", new Color(240, 255, 255));
+        m.put("lightcyan", new Color(224, 255, 255));
+        m.put("gainsboro", new Color(220, 220, 220));
+        m.put("dimgray", new Color(105, 105, 105));
+        m.put("dimgrey", new Color(105, 105, 105));
+        m.put("slategray", new Color(112, 128, 144));
+        m.put("slategrey", new Color(112, 128, 144));
+        m.put("lightslategray", new Color(119, 136, 153));
+        m.put("lightslategrey", new Color(119, 136, 153));
+        m.put("darkslategray", new Color(47, 79, 79));
+        m.put("darkslategrey", new Color(47, 79, 79));
+        m.put("rebeccapurple", new Color(102, 51, 153));
+        m.put("mediumblue", new Color(0, 0, 205));
+        m.put("royalblue", new Color(65, 105, 225));
+        m.put("dodgerblue", new Color(30, 144, 255));
+        m.put("deepskyblue", new Color(0, 191, 255));
+        m.put("cornflowerblue", new Color(100, 149, 237));
+        m.put("mediumseagreen", new Color(60, 179, 113));
+        m.put("seagreen", new Color(46, 139, 87));
+        m.put("forestgreen", new Color(34, 139, 34));
+        m.put("limegreen", new Color(50, 205, 50));
+        m.put("springgreen", new Color(0, 255, 127));
+        m.put("mediumspringgreen", new Color(0, 250, 154));
+        m.put("lightseagreen", new Color(32, 178, 170));
+        m.put("darkcyan", new Color(0, 139, 139));
+        m.put("cadetblue", new Color(95, 158, 160));
+        m.put("mediumturquoise", new Color(72, 209, 204));
+        m.put("darkturquoise", new Color(0, 206, 209));
+        m.put("aqua", new Color(0, 255, 255));
+        m.put("aquamarine", new Color(127, 255, 212));
+        m.put("palegreen", new Color(152, 251, 152));
+        m.put("yellowgreen", new Color(154, 205, 50));
+        m.put("olivedrab", new Color(107, 142, 35));
+        m.put("darkolivegreen", new Color(85, 107, 47));
+        m.put("darkkhaki", new Color(189, 183, 107));
+        m.put("palegoldenrod", new Color(238, 232, 170));
+        m.put("lightgoldenrodyellow", new Color(250, 250, 210));
+        m.put("lemonchiffon", new Color(255, 250, 205));
+        m.put("moccasin", new Color(255, 228, 181));
+        m.put("peachpuff", new Color(255, 218, 185));
+        m.put("bisque", new Color(255, 228, 196));
+        m.put("navajowhite", new Color(255, 222, 173));
+        m.put("wheat", new Color(245, 222, 179));
+        m.put("burlywood", new Color(222, 184, 135));
+        m.put("sandybrown", new Color(244, 164, 96));
+        m.put("peru", new Color(205, 133, 63));
+        m.put("saddlebrown", new Color(139, 69, 19));
+        m.put("sienna", new Color(160, 82, 45));
+        m.put("rosybrown", new Color(188, 143, 143));
+        m.put("indianred", new Color(205, 92, 92));
+        m.put("lightcoral", new Color(240, 128, 128));
+        m.put("darksalmon", new Color(233, 150, 122));
+        m.put("lightsalmon", new Color(255, 160, 122));
+        m.put("orangered", new Color(255, 69, 0));
+        m.put("darkorange", new Color(255, 140, 0));
+        m.put("papayawhip", new Color(255, 239, 213));
+        m.put("blanchedalmond", new Color(255, 235, 205));
+        m.put("antiquewhite", new Color(250, 235, 215));
+        m.put("linen", new Color(250, 240, 230));
+        m.put("oldlace", new Color(253, 245, 230));
+        m.put("cornsilk", new Color(255, 248, 220));
+        m.put("firebrick", new Color(178, 34, 34));
+        m.put("mediumvioletred", new Color(199, 21, 133));
+        m.put("deeppink", new Color(255, 20, 147));
+        m.put("hotpink", new Color(255, 105, 180));
+        m.put("palevioletred", new Color(219, 112, 147));
+        m.put("fuchsia", new Color(255, 0, 255));
+        m.put("mediumorchid", new Color(186, 85, 211));
+        m.put("mediumpurple", new Color(147, 112, 219));
+        m.put("darkviolet", new Color(148, 0, 211));
+        m.put("darkorchid", new Color(153, 50, 204));
+        m.put("darkmagenta", new Color(139, 0, 139));
+        m.put("slateblue", new Color(106, 90, 205));
+        m.put("darkslateblue", new Color(72, 61, 139));
+        m.put("mediumslateblue", new Color(123, 104, 238));
+
         return m;
     }
 
@@ -887,10 +1305,74 @@ public final class ComputedStyle {
                 }
             }
 
+            // hsl() / hsla() — common on modern sites
+            if (value.startsWith("hsl(") || value.startsWith("hsla(")) {
+                int open = value.indexOf('(');
+                int close = value.lastIndexOf(')');
+                if (close <= open) {
+                    return null;
+                }
+                String inside = value.substring(open + 1, close);
+                // Accept both comma and space separators (modern CSS)
+                String[] parts = inside.split("[,\\s/]+");
+                if (parts.length >= 3) {
+                    float h = Float.parseFloat(parts[0].trim().replace("deg", ""));
+                    float s = parsePercentOrFraction(parts[1]);
+                    float l = parsePercentOrFraction(parts[2]);
+                    float a = 1f;
+                    if (parts.length >= 4) {
+                        a = parsePercentOrFraction(parts[3]);
+                        if (a > 1f) a = a / 100f; // treat >1 as percent
+                    }
+                    return hslToColor(h, s, l, a);
+                }
+            }
+
         } catch (Exception ignored) {
         }
 
         return null;
+    }
+
+    private static float parsePercentOrFraction(String value) {
+        value = value.trim();
+        if (value.endsWith("%")) {
+            return Float.parseFloat(value.substring(0, value.length() - 1)) / 100f;
+        }
+        return Float.parseFloat(value);
+    }
+
+    /** Convert HSL (h in degrees, s/l in 0..1) to a Color. */
+    private static Color hslToColor(float h, float s, float l, float alpha) {
+        h = ((h % 360f) + 360f) % 360f;
+        s = Math.max(0f, Math.min(1f, s));
+        l = Math.max(0f, Math.min(1f, l));
+        alpha = Math.max(0f, Math.min(1f, alpha));
+
+        float c = (1f - Math.abs(2f * l - 1f)) * s;
+        float x = c * (1f - Math.abs((h / 60f) % 2f - 1f));
+        float m = l - c / 2f;
+
+        float r1, g1, b1;
+        if (h < 60f) {
+            r1 = c; g1 = x; b1 = 0f;
+        } else if (h < 120f) {
+            r1 = x; g1 = c; b1 = 0f;
+        } else if (h < 180f) {
+            r1 = 0f; g1 = c; b1 = x;
+        } else if (h < 240f) {
+            r1 = 0f; g1 = x; b1 = c;
+        } else if (h < 300f) {
+            r1 = x; g1 = 0f; b1 = c;
+        } else {
+            r1 = c; g1 = 0f; b1 = x;
+        }
+
+        int r = Math.round((r1 + m) * 255f);
+        int g = Math.round((g1 + m) * 255f);
+        int b = Math.round((b1 + m) * 255f);
+        int a = Math.round(alpha * 255f);
+        return new Color(clamp(r), clamp(g), clamp(b), clamp(a));
     }
 
     private static int parseRgbComponent(String value) {
@@ -1006,5 +1488,30 @@ public final class ComputedStyle {
             if (parts.length == 4 && parts[1].equalsIgnoreCase("auto")) return true; // right is index 1 in 4-value shorthand
         }
         return false;
+    }
+
+    public String backgroundImageUrl() {
+        String bgImage = get("background-image");
+        if (bgImage.isBlank() || bgImage.equalsIgnoreCase("none")) {
+            bgImage = get("background");
+        }
+        if (bgImage.isBlank() || !bgImage.contains("url(")) {
+            return null;
+        }
+
+        int start = bgImage.indexOf("url(");
+        int openParen = bgImage.indexOf('(', start);
+        int closeParen = bgImage.indexOf(')', openParen);
+        if (openParen < 0 || closeParen < 0) {
+            return null;
+        }
+
+        String rawUrl = bgImage.substring(openParen + 1, closeParen).trim();
+        // Strip surrounding quotes if present (' or ")
+        if ((rawUrl.startsWith("\"") && rawUrl.endsWith("\"")) ||
+                (rawUrl.startsWith("'") && rawUrl.endsWith("'"))) {
+            rawUrl = rawUrl.substring(1, rawUrl.length() - 1);
+        }
+        return rawUrl;
     }
 }

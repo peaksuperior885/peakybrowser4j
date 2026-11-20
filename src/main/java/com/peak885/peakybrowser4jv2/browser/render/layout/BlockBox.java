@@ -1,5 +1,7 @@
 package com.peak885.peakybrowser4jv2.browser.render.layout;
 
+import com.peak885.peakybrowser4jv2.browser.BrowserLoader;
+import com.peak885.peakybrowser4jv2.browser.image.ImageData;
 import com.peak885.peakybrowser4jv2.browser.render.style.ComputedStyle;
 import org.tinylog.Logger;
 
@@ -8,19 +10,30 @@ import java.awt.FontMetrics;
 import java.awt.Graphics2D;
 import java.awt.Paint;
 import java.awt.Color;
+import java.awt.image.BufferedImage;
 import java.util.ArrayList;
 import java.util.List;
 
 public final class BlockBox extends Box {
 
     private final String marker;
+    private final BrowserLoader browserLoader;
 
     public BlockBox(
             ComputedStyle style,
             String marker
     ) {
+        this(style, marker, null);
+    }
+
+    public BlockBox(
+            ComputedStyle style,
+            String marker,
+            BrowserLoader browserLoader
+    ) {
         super(style);
         this.marker = marker;
+        this.browserLoader = browserLoader;
     }
 
     @Override
@@ -61,25 +74,12 @@ public final class BlockBox extends Box {
         /*
          * Content box.
          */
-        x =
-                borderBoxX + paddingLeft;
+        x = borderBoxX + paddingLeft;
+        y = borderBoxY + paddingTop;
+        width = Math.max(0, borderBoxWidth - paddingLeft - paddingRight);
 
-        y =
-                borderBoxY + paddingTop;
-
-        width =
-                Math.max(
-                        0,
-                        borderBoxWidth
-                                - paddingLeft
-                                - paddingRight
-                );
-
-        List<Box> normalChildren =
-                new ArrayList<>();
-
-        List<Box> positionedChildren =
-                new ArrayList<>();
+        List<Box> normalChildren = new ArrayList<>();
+        List<Box> positionedChildren = new ArrayList<>();
 
         for (Box child : children) {
             if (child.style.isAbsolutelyPositioned()) {
@@ -96,45 +96,41 @@ public final class BlockBox extends Box {
          * FORCED FLEX ROW (TESTING OVERRIDE)
          * -------------------------------------------------------------
          */
-        boolean forceFlexTest = false; // Flip to false later
+        boolean forceFlexTest = false;
 
-        if ((style.isFlex() || forceFlexTest)
-                && !style.isFlexColumn()) {
-
-            contentHeight =
-                    layoutFlexRow(
-                            normalChildren
-                    );
-
+        if ((style.isFlex() || forceFlexTest) && !style.isFlexColumn()) {
+            contentHeight = layoutFlexRow(normalChildren);
+        } else {
+            contentHeight = layoutVertical(normalChildren);
         }
 
-        /*
-         * -------------------------------------------------------------
-         * NORMAL BLOCK / FLEX COLUMN
-         * -------------------------------------------------------------
-         */
-        else {
+        float resolvedHeight = style.height(-1f, style.fontSize(), width);
+        float resolvedMinHeight = style.minHeight(-1f, style.fontSize(), width);
+        float resolvedMaxHeight = style.maxHeight(Float.MAX_VALUE, style.fontSize(), width);
+        boolean borderBox = style.isBorderBox();
+        float verticalPadding = paddingTop + paddingBottom;
 
-            contentHeight =
-                    layoutVertical(
-                            normalChildren
-                    );
+        if (resolvedHeight >= 0f) {
+            contentHeight = borderBox
+                    ? Math.max(0f, resolvedHeight - verticalPadding)
+                    : resolvedHeight;
+        }
+        if (resolvedMinHeight >= 0f) {
+            float minContentHeight = borderBox
+                    ? Math.max(0f, resolvedMinHeight - verticalPadding)
+                    : resolvedMinHeight;
+            contentHeight = Math.max(contentHeight, minContentHeight);
+        }
+        if (resolvedMaxHeight < Float.MAX_VALUE) {
+            float maxContentHeight = borderBox
+                    ? Math.max(0f, resolvedMaxHeight - verticalPadding)
+                    : resolvedMaxHeight;
+            contentHeight = Math.min(contentHeight, maxContentHeight);
         }
 
-        height =
-                Math.max(
-                        0,
-                        contentHeight
-                );
+        height = Math.max(0, contentHeight);
+        borderBoxHeight = height + paddingTop + paddingBottom;
 
-        borderBoxHeight =
-                height
-                        + paddingTop
-                        + paddingBottom;
-
-        /*
-         * Absolutely positioned children do not affect height.
-         */
         for (Box child : positionedChildren) {
             layoutAbsoluteChild(child);
         }
@@ -145,13 +141,7 @@ public final class BlockBox extends Box {
 
         for (Box child : children) {
             float childWidth = width;
-
-            child.layout(
-                    childWidth,
-                    x,
-                    cursorY
-            );
-
+            child.layout(childWidth, x, cursorY);
             cursorY += child.totalHeight();
         }
 
@@ -166,18 +156,16 @@ public final class BlockBox extends Box {
 
         float gap = Math.max(0, style.gap());
         boolean wrap = style.isFlexWrap();
-        String justifyContent = style.get("justify-content"); // e.g., center, flex-end, space-between
+        String justifyContent = style.get("justify-content");
 
         List<List<FlexItem>> rows = new ArrayList<>();
         List<FlexItem> currentRow = new ArrayList<>();
         float currentRowWidth = 0;
 
-        // --- PASS 1: Group children into rows and measure widths ---
         for (Box child : children) {
             float childWidth = resolveFlexChildWidth(child);
             childWidth = Math.max(0, childWidth);
 
-            // Check if we need to wrap to the next row
             boolean shouldWrap = wrap
                     && !currentRow.isEmpty()
                     && (currentRowWidth + gap + childWidth > width);
@@ -196,7 +184,6 @@ public final class BlockBox extends Box {
             rows.add(currentRow);
         }
 
-        // --- PASS 2: Position items and apply justify-content alignment ---
         float rowY = y;
         float totalHeight = 0;
 
@@ -210,7 +197,6 @@ public final class BlockBox extends Box {
             float cursorX = x;
             float itemSpacing = gap;
 
-            // Handle alignment properties
             if (justifyContent != null) {
                 String jc = justifyContent.trim().toLowerCase();
                 if (jc.equals("center")) {
@@ -244,17 +230,16 @@ public final class BlockBox extends Box {
                 }
 
                 rowHeight = Math.max(rowHeight, item.child.totalHeight());
-                cursorX += actualWidth + (i == 0 ? 0 : itemSpacing - gap) + gap; // adjust spacing
+                cursorX += actualWidth + (i == 0 ? 0 : itemSpacing - gap) + gap;
             }
 
             rowY += rowHeight + gap;
-            totalHeight = rowY - y - gap; // remove trailing gap
+            totalHeight = rowY - y - gap;
         }
 
         return Math.max(0, totalHeight);
     }
 
-    // Helper structure for tracking row items during layout passes
     private static final class FlexItem {
         final Box child;
         final float width;
@@ -267,204 +252,93 @@ public final class BlockBox extends Box {
 
     private float resolveFlexChildWidth(Box child) {
         float available = Math.max(0f, width);
-
-        // Explicit CSS width.
-        float explicitWidth = child.style.width(
-                -1f,
-                child.style.fontSize(),
-                available
-        );
+        float explicitWidth = child.style.width(-1f, child.style.fontSize(), available);
 
         if (explicitWidth >= 0f) {
             return explicitWidth;
         }
 
-        // Inline flow intrinsic width.
         if (child instanceof InlineFlowBox inlineFlow) {
             float intrinsic = inlineFlow.intrinsicWidth();
-
-            if (intrinsic > 0f) {
-                return intrinsic;
-            }
+            if (intrinsic > 0f) return intrinsic;
         }
 
-        // Content-based width.
         if (!child.children.isEmpty()) {
             float natural = naturalContentWidth(child, available);
-
-            if (natural > 0f) {
-                return natural;
-            }
+            if (natural > 0f) return natural;
         }
 
-        // Already-established layout width.
         float existing = child.getBorderBoxWidth();
+        if (existing > 0f) return existing;
 
-        if (existing > 0f) {
-            return existing;
-        }
-
-        // Unresolved block-level flex items should not collapse to zero.
-        if (child instanceof BlockBox) {
-            return available;
-        }
-
+        if (child instanceof BlockBox) return available;
         return 0f;
     }
 
-    private void layoutAbsoluteChild(
-            Box child
-    ) {
-        float childWidth =
-                child.style.width(
-                        -1f,
-                        child.style.fontSize(),
-                        width
-                );
+    private void layoutAbsoluteChild(Box child) {
+        float childWidth = child.style.width(-1f, child.style.fontSize(), width);
 
-        /*
-         * Auto width: measure first.
-         */
         if (childWidth <= 0) {
-
-            child.layout(
-                    width,
-                    0,
-                    0
-            );
-
-            childWidth =
-                    naturalContentWidth(
-                            child,
-                            width
-                    );
+            child.layout(width, 0, 0);
+            childWidth = naturalContentWidth(child, width);
         }
 
-        childWidth =
-                Math.max(
-                        0,
-                        childWidth
-                );
+        childWidth = Math.max(0, childWidth);
+        child.layout(childWidth, 0, 0);
 
-        /*
-         * Initial measurement.
-         */
-        child.layout(
-                childWidth,
-                0,
-                0
-        );
+        Float left = child.style.leftOffset(width);
+        Float right = child.style.rightOffset(width);
+        Float top = child.style.topOffset(height);
+        Float bottom = child.style.bottomOffset(height);
 
-        Float left =
-                child.style.leftOffset(width);
-
-        Float right =
-                child.style.rightOffset(width);
-
-        Float top =
-                child.style.topOffset(height);
-
-        Float bottom =
-                child.style.bottomOffset(height);
-
-        float marginLeft =
-                child.style.marginLeft();
-
-        float marginTop =
-                child.style.marginTop();
-
-        float childWidthActual =
-                child.getBorderBoxWidth();
-
-        float childHeightActual =
-                child.getBorderBoxHeight();
+        float marginLeft = style.marginLeft();
+        float marginTop = style.marginTop();
+        float childWidthActual = child.getBorderBoxWidth();
+        float childHeightActual = child.getBorderBoxHeight();
 
         float finalX;
-
         if (left != null) {
-
-            finalX =
-                    x + left;
-
+            finalX = x + left;
         } else if (right != null) {
-
-            finalX =
-                    x
-                            + width
-                            - right
-                            - childWidthActual;
-
+            finalX = x + width - right - childWidthActual;
         } else {
-
             finalX = x;
         }
 
         float finalY;
-
         if (top != null) {
-
-            finalY =
-                    y + top;
-
+            finalY = y + top;
         } else if (bottom != null) {
-
-            finalY =
-                    y
-                            + height
-                            - bottom
-                            - childHeightActual;
-
+            finalY = y + height - bottom - childHeightActual;
         } else {
-
             finalY = y;
         }
 
-        child.layout(
-                childWidth,
-                finalX - marginLeft,
-                finalY - marginTop
-        );
+        child.layout(childWidth, finalX - marginLeft, finalY - marginTop);
     }
 
-    private static float naturalContentWidth(
-            Box box,
-            float availableWidth
-    ) {
+    private static float naturalContentWidth(Box box, float availableWidth) {
         float measured = 0;
 
         for (Box child : box.children) {
             if (child instanceof InlineFlowBox flow) {
-                measured = Math.max(
-                        measured,
-                        flow.intrinsicWidth()
-                );
+                measured = Math.max(measured, flow.intrinsicWidth());
             } else if (!child.children.isEmpty()) {
-                // Recursively check nested block containers
-                measured = Math.max(
-                        measured,
-                        naturalContentWidth(child, availableWidth)
-                );
+                measured = Math.max(measured, naturalContentWidth(child, availableWidth));
             } else {
-                measured = Math.max(
-                        measured,
-                        child.getBorderBoxWidth()
-                );
+                measured = Math.max(measured, child.getBorderBoxWidth());
             }
         }
 
         if (measured <= 0) {
-            return availableWidth; // If truly empty, default to available space instead of 0
+            return availableWidth;
         }
 
-        return Math.min(
-                availableWidth,
-                measured
-        );
+        return Math.min(availableWidth, measured);
     }
 
     @Override
     public void paint(Graphics2D g) {
-
         int bx = Math.round(borderBoxX);
         int by = Math.round(borderBoxY);
         int bw = Math.round(borderBoxWidth);
@@ -472,80 +346,337 @@ public final class BlockBox extends Box {
         float radius = style.borderRadius();
         int diameter = radius > 0 ? Math.round(radius * 2) : 0;
 
-        paintBoxShadow(g, bx, by, bw, bh, diameter);
+        long now = System.currentTimeMillis();
+        ComputedStyle.Transform tx = style.transform();
+        Color animBg = null;
+        ComputedStyle.BoxShadow animShadow = null;
+        if (anim != null) {
+            if (anim.done(now)) {
+                anim = null;
+            } else {
+                tx = anim.transform(now);
+                animBg = anim.background(now);
+                animShadow = anim.shadow(now);
+            }
+        }
 
-        Paint background =
-                style.backgroundPaint(
-                        borderBoxWidth,
-                        borderBoxHeight
-                );
+        java.awt.geom.AffineTransform saved = null;
+        if (!tx.isIdentity()) {
+            saved = g.getTransform();
+            // Transform origin: center of the border box (matches common UI intent)
+            float cx = borderBoxX + borderBoxWidth / 2f;
+            float cy = borderBoxY + borderBoxHeight / 2f;
+            g.translate(cx + tx.translateX(), cy + tx.translateY());
+            g.rotate(Math.toRadians(tx.rotateDeg()));
+            g.scale(tx.scaleX(), tx.scaleY());
+            g.translate(-cx, -cy);
+        }
 
-        if (background != null) {
+        paintBoxShadow(g, bx, by, bw, bh, diameter, animShadow);
 
-            boolean visible = true;
+        String bgUrl = style.backgroundImageUrl();
+        if (bgUrl != null && !bgUrl.isBlank() && sourceElement != null && browserLoader != null) {
+            String absoluteUrl = bgUrl;
+            try {
+                absoluteUrl = java.net.URI.create(sourceElement.baseUri()).resolve(bgUrl).toString();
+            } catch (Exception ignored) {}
 
-            if (background instanceof Color color) {
-                visible = color.getAlpha() > 0;
+            ImageContext imgCtx = ImageContext.forElement(sourceElement, browserLoader);
+            imgCtx.load(absoluteUrl, () -> {
+                javax.swing.SwingUtilities.invokeLater(() -> {
+                    for (java.awt.Window w : java.awt.Window.getWindows()) {
+                        if (w.isDisplayable()) w.repaint();
+                    }
+                });
+            });
+
+            ImageData imgData = imgCtx.image();
+            if (imgData != null && imgData.firstFrame() != null) {
+                BufferedImage frame = imgData.firstFrame();
+                paintBackgroundImage(g, frame, bx, by, bw, bh, style);
+            } else {
+                paintSolidOrGradientBackground(g, bx, by, bw, bh, radius, diameter, animBg);
+            }
+        } else {
+            paintSolidOrGradientBackground(g, bx, by, bw, bh, radius, diameter, animBg);
+        }
+
+        if (marker != null) {
+            Font font = new Font("SansSerif", Font.PLAIN, Math.max(1, Math.round(style.fontSize())));
+            g.setFont(font);
+            g.setColor(style.color());
+
+            FontMetrics fm = g.getFontMetrics();
+            float markerX = Math.max(0, x - fm.stringWidth(marker) - 6);
+            float markerY = y + fm.getAscent();
+
+            g.drawString(marker, Math.round(markerX), Math.round(markerY));
+        }
+
+        for (Box child : children) {
+            child.paint(g);
+        }
+
+        if (saved != null) {
+            g.setTransform(saved);
+        }
+    }
+
+    /**
+     * Paint background images with basic CSS sizing, positioning, and repeat.
+     * Positioning matters for sprite sheets: scaling the entire sheet into each
+     * element hides the individual icon or challenge tile selected by CSS.
+     */
+    private static void paintBackgroundImage(
+            Graphics2D g,
+            BufferedImage image,
+            int bx,
+            int by,
+            int bw,
+            int bh,
+            ComputedStyle style
+    ) {
+        if (image == null || image.getWidth() <= 0 || image.getHeight() <= 0 || bw <= 0 || bh <= 0) {
+            return;
+        }
+
+        double drawWidth = image.getWidth();
+        double drawHeight = image.getHeight();
+        String size = effectiveBackgroundValue(style, "background-size").trim().toLowerCase();
+        String[] sizeParts = size.isBlank() ? new String[0] : size.split("\\s+");
+
+        if ("cover".equals(size)) {
+            double scale = Math.max((double) bw / drawWidth, (double) bh / drawHeight);
+            drawWidth *= scale;
+            drawHeight *= scale;
+        } else if ("contain".equals(size)) {
+            double scale = Math.min((double) bw / drawWidth, (double) bh / drawHeight);
+            drawWidth *= scale;
+            drawHeight *= scale;
+        } else if (sizeParts.length > 0) {
+            Double requestedWidth = backgroundSizeLength(sizeParts[0], bw);
+            Double requestedHeight = sizeParts.length > 1
+                    ? backgroundSizeLength(sizeParts[1], bh)
+                    : null;
+            if (requestedWidth != null && requestedHeight != null) {
+                drawWidth = requestedWidth;
+                drawHeight = requestedHeight;
+            } else if (requestedWidth != null) {
+                drawHeight *= requestedWidth / drawWidth;
+                drawWidth = requestedWidth;
+            } else if (requestedHeight != null) {
+                drawWidth *= requestedHeight / drawHeight;
+                drawHeight = requestedHeight;
+            }
+        }
+
+        if (drawWidth <= 0 || drawHeight <= 0 || !Double.isFinite(drawWidth) || !Double.isFinite(drawHeight)) {
+            return;
+        }
+
+        String[] position = backgroundPositionParts(
+                effectiveBackgroundValue(style, "background-position", "0% 0%")
+        );
+        double offsetX = backgroundPositionOffset(position[0], bw - drawWidth);
+        double offsetY = backgroundPositionOffset(position[1], bh - drawHeight);
+        int drawWidthPx = Math.max(1, (int) Math.round(drawWidth));
+        int drawHeightPx = Math.max(1, (int) Math.round(drawHeight));
+        int startX = bx + (int) Math.round(offsetX);
+        int startY = by + (int) Math.round(offsetY);
+
+        String repeat = effectiveBackgroundValue(style, "background-repeat", "repeat").trim().toLowerCase();
+        String[] repeatParts = repeat.split("\\s+");
+        boolean repeatX = repeat.equals("repeat") || repeat.equals("repeat-x")
+                || (repeatParts.length > 0 && "repeat".equals(repeatParts[0]));
+        boolean repeatY = repeat.equals("repeat") || repeat.equals("repeat-y")
+                || (repeatParts.length > 1 && "repeat".equals(repeatParts[1]));
+        if (repeat.equals("no-repeat")) {
+            repeatX = false;
+            repeatY = false;
+        }
+
+        Graphics2D clipped = (Graphics2D) g.create();
+        try {
+            clipped.clipRect(bx, by, bw, bh);
+            int firstX = startX;
+            int firstY = startY;
+            if (repeatX) {
+                while (firstX > bx) firstX -= drawWidthPx;
+            }
+            if (repeatY) {
+                while (firstY > by) firstY -= drawHeightPx;
             }
 
-            if (visible) {
+            int maxX = repeatX ? bx + bw : startX + 1;
+            int maxY = repeatY ? by + bh : startY + 1;
+            int countX = 0;
+            for (int py = firstY; py < maxY && countX < 1024; py += repeatY ? drawHeightPx : drawHeightPx + bh + 1) {
+                int countY = 0;
+                for (int px = firstX; px < maxX && countY < 1024; px += repeatX ? drawWidthPx : drawWidthPx + bw + 1) {
+                    clipped.drawImage(image, px, py, drawWidthPx, drawHeightPx, null);
+                    countY++;
+                }
+                countX++;
+            }
+        } finally {
+            clipped.dispose();
+        }
+    }
 
-                g.setPaint(background);
+    private static Double backgroundSizeLength(String value, double basis) {
+        value = value.trim().toLowerCase();
+        if (value.equals("auto") || value.isEmpty()) return null;
+        try {
+            if (value.endsWith("%")) {
+                return Double.parseDouble(value.substring(0, value.length() - 1)) * basis / 100d;
+            }
+            if (value.endsWith("px")) {
+                return Double.parseDouble(value.substring(0, value.length() - 2));
+            }
+            return Double.parseDouble(value);
+        } catch (NumberFormatException ignored) {
+            return null;
+        }
+    }
 
+    private static String effectiveBackgroundValue(ComputedStyle style, String property) {
+        return effectiveBackgroundValue(style, property, "");
+    }
+
+    private static String effectiveBackgroundValue(ComputedStyle style, String property, String fallback) {
+        String longhand = style.get(property).trim();
+        if (!longhand.isEmpty()) return longhand;
+
+        String shorthand = style.get("background").trim();
+        if (shorthand.isEmpty()) return fallback;
+        String tokensOnly = shorthand.replaceAll("(?i)url\\([^)]*\\)", " ").replace("/", " / ");
+        String[] tokens = tokensOnly.trim().split("\\s+");
+        int slash = -1;
+        for (int i = 0; i < tokens.length; i++) {
+            if (tokens[i].equals("/")) {
+                slash = i;
+                break;
+            }
+        }
+
+        List<String> values = new ArrayList<>();
+        if (property.equals("background-size")) {
+            if (slash < 0) return fallback;
+            for (int i = slash + 1; i < tokens.length && values.size() < 2; i++) {
+                String token = tokens[i].toLowerCase();
+                if (isBackgroundRepeatToken(token)) break;
+                if (isBackgroundSizeToken(token)) values.add(token);
+            }
+        } else if (property.equals("background-repeat")) {
+            for (String raw : tokens) {
+                String token = raw.toLowerCase();
+                if (isBackgroundRepeatToken(token)) values.add(token);
+            }
+        } else if (property.equals("background-position")) {
+            int limit = slash < 0 ? tokens.length : slash;
+            for (int i = 0; i < limit && values.size() < 2; i++) {
+                String token = tokens[i].toLowerCase();
+                if (isBackgroundPositionToken(token)) values.add(token);
+            }
+        }
+        return values.isEmpty() ? fallback : String.join(" ", values);
+    }
+
+    private static boolean isBackgroundRepeatToken(String token) {
+        return token.equals("repeat") || token.equals("no-repeat") || token.equals("repeat-x")
+                || token.equals("repeat-y") || token.equals("space") || token.equals("round");
+    }
+
+    private static boolean isBackgroundSizeToken(String token) {
+        return token.equals("auto") || token.equals("cover") || token.equals("contain")
+                || token.endsWith("px") || token.endsWith("%") || token.matches("[-+]?(?:\\d*\\.)?\\d+");
+    }
+
+    private static boolean isBackgroundPositionToken(String token) {
+        return token.equals("left") || token.equals("right") || token.equals("top")
+                || token.equals("bottom") || token.equals("center") || token.equals("auto")
+                || token.endsWith("px") || token.endsWith("%")
+                || token.matches("[-+]?(?:\\d*\\.)?\\d+");
+    }
+
+    private static String[] backgroundPositionParts(String value) {
+        String[] parts = value == null ? new String[0] : value.trim().toLowerCase().split("\\s+");
+        if (parts.length == 0 || (parts.length == 1 && parts[0].isBlank())) return new String[]{"0%", "0%"};
+        if (parts.length == 1) {
+            String one = parts[0];
+            if (one.equals("center")) return new String[]{"center", "center"};
+            if (one.equals("top") || one.equals("bottom")) return new String[]{"center", one};
+            return new String[]{one, "center"};
+        }
+        if ((parts[0].equals("top") || parts[0].equals("bottom"))
+                && (parts[1].equals("left") || parts[1].equals("right") || parts[1].equals("center"))) {
+            return new String[]{parts[1], parts[0]};
+        }
+        return new String[]{parts[0], parts[1]};
+    }
+
+    private static double backgroundPositionOffset(String value, double remainingSpace) {
+        return switch (value) {
+            case "left", "top" -> 0d;
+            case "center" -> remainingSpace / 2d;
+            case "right", "bottom" -> remainingSpace;
+            default -> {
+                Double amount = backgroundSizeLength(value, remainingSpace);
+                yield amount == null ? 0d : amount;
+            }
+        };
+    }
+
+    private void paintSolidOrGradientBackground(
+            Graphics2D g,
+            int bx,
+            int by,
+            int bw,
+            int bh,
+            float radius,
+            int diameter,
+            Color animOverride
+    ) {
+        if (animOverride != null) {
+            if (animOverride.getAlpha() > 0) {
+                g.setPaint(animOverride);
                 if (radius > 0) {
                     g.fillRoundRect(bx, by, bw, bh, diameter, diameter);
                 } else {
                     g.fillRect(bx, by, bw, bh);
                 }
             }
+            return;
         }
 
-        /*
-         * List marker.
-         */
-        if (marker != null) {
-
-            Font font =
-                    new Font(
-                            "SansSerif",
-                            Font.PLAIN,
-                            Math.max(
-                                    1,
-                                    Math.round(
-                                            style.fontSize()
-                                    )
-                            )
-                    );
-
-            g.setFont(font);
-            g.setColor(style.color());
-
-            FontMetrics fm =
-                    g.getFontMetrics();
-
-            float markerX =
-                    Math.max(
-                            0,
-                            x
-                                    - fm.stringWidth(marker)
-                                    - 6
-                    );
-
-            float markerY =
-                    y + fm.getAscent();
-
-            g.drawString(
-                    marker,
-                    Math.round(markerX),
-                    Math.round(markerY)
-            );
+        // Solid base first so multi-layer backgrounds that end in a solid
+        // color (maven site: radials + var(--bg-deep)) don't leave a white page.
+        Color base = style.backgroundColor();
+        if (base != null && base.getAlpha() > 0) {
+            g.setColor(base);
+            if (radius > 0) {
+                g.fillRoundRect(bx, by, bw, bh, diameter, diameter);
+            } else {
+                g.fillRect(bx, by, bw, bh);
+            }
         }
 
-        /*
-         * Children.
-         */
-        for (Box child : children) {
-            child.paint(g);
+        Paint background = style.backgroundPaint(borderBoxWidth, borderBoxHeight);
+        if (background != null) {
+            if (background instanceof Color color) {
+                if (color.getAlpha() == 0) {
+                    return;
+                }
+                if (base != null && color.getRGB() == base.getRGB()) {
+                    return;
+                }
+            }
+            g.setPaint(background);
+            if (radius > 0) {
+                g.fillRoundRect(bx, by, bw, bh, diameter, diameter);
+            } else {
+                g.fillRect(bx, by, bw, bh);
+            }
         }
     }
 
@@ -555,9 +686,11 @@ public final class BlockBox extends Box {
             int by,
             int bw,
             int bh,
-            int diameter
+            int diameter,
+            ComputedStyle.BoxShadow animOverride
     ) {
-        ComputedStyle.BoxShadow shadow = style.boxShadow();
+        ComputedStyle.BoxShadow shadow =
+                animOverride != null ? animOverride : style.boxShadow();
         if (shadow == null || bw <= 0 || bh <= 0) {
             return;
         }

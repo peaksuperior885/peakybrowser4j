@@ -111,6 +111,16 @@ public final class InstallBrowserCompat {
                         }
                     }
 
+                    var handler = this['on' + event.type];
+                    if (typeof handler === 'function') {
+                        try {
+                            handler.call(this, event);
+                        } catch (e) {
+                            if (typeof console !== 'undefined' && console.error)
+                                console.error('Unhandled event handler error:', e);
+                        }
+                    }
+
                     return !event.defaultPrevented;
                 };
             }
@@ -745,10 +755,20 @@ public final class InstallBrowserCompat {
                         __windowTarget
                     );
 
-                dispatchEvent =
-                    __windowTarget.dispatchEvent.bind(
-                        __windowTarget
-                    );
+                var __dispatchWindowListeners =
+                    __windowTarget.dispatchEvent.bind(__windowTarget);
+                dispatchEvent = function(event) {
+                    var result = __dispatchWindowListeners(event);
+                    var handler = event && window['on' + event.type];
+                    if (typeof handler === 'function') {
+                        try { handler.call(window, event); }
+                        catch (e) {
+                            if (typeof console !== 'undefined' && console.error)
+                                console.error('Unhandled window event handler error:', e);
+                        }
+                    }
+                    return result;
+                };
             }
 
             if (typeof window !== 'undefined') {
@@ -1010,48 +1030,53 @@ public final class InstallBrowserCompat {
 
             // window.Image — used heavily by Google for beacons / preloads.
             // new Image() must return a usable object with a writable .src.
-            if (typeof Image === 'undefined') {
-                Image = function(width, height) {
-                    this.tagName = 'IMG';
-                    this.nodeName = 'IMG';
-                    this.width = width || 0;
-                    this.height = height || 0;
-                    this.naturalWidth = 0;
-                    this.naturalHeight = 0;
-                    this.complete = false;
-                    this.onload = null;
-                    this.onerror = null;
-                    this.onabort = null;
-                    var _src = '';
-                    var self = this;
-                    Object.defineProperty(this, 'src', {
-                        get: function() { return _src; },
-                        set: function(v) {
-                            _src = v == null ? '' : String(v);
-                            // Fire onload asynchronously so page scripts that
-                            // set img.onload = ...; img.src = ... still work.
-                            if (typeof setTimeout === 'function') {
-                                setTimeout(function() {
-                                    self.complete = true;
-                                    self.naturalWidth = self.width || 1;
-                                    self.naturalHeight = self.height || 1;
-                                    if (typeof self.onload === 'function') {
-                                        try { self.onload.call(self); } catch (e) {}
-                                    }
-                                }, 0);
-                            }
-                        },
-                        enumerable: true,
-                        configurable: true
-                    });
-                };
-                Image.prototype = HTMLImageElement.prototype || {};
-                Image[Symbol.hasInstance] = HTMLImageElement[Symbol.hasInstance];
-                // Alias used by some scripts
-                if (typeof HTMLImageElement !== 'undefined') {
-                    // keep both names
-                }
-            }
+                if (typeof Image === 'undefined') {
+                      Image = function(width, height) {
+                          this.tagName = 'IMG';
+                          this.nodeName = 'IMG';
+                          this.width = width || 0;
+                          this.height = height || 0;
+                          this.naturalWidth = 0;
+                          this.naturalHeight = 0;
+                          this.complete = false;
+                          this.onload = null;
+                          this.onerror = null;
+                          this.onabort = null;
+                          this._javaImage = null; // Stores the underlying BufferedImage for canvas drawing
+                
+                          var _src = '';
+                          var self = this;
+                          Object.defineProperty(this, 'src', {
+                              get: function() { return _src; },
+                              set: function(v) {
+                                  _src = v == null ? '' : String(v);
+                                  if (!_src) return;
+                
+                                  // Call Java-side native image fetcher if available
+                                  if (typeof __nativeImageFetch === 'function') {
+                                      __nativeImageFetch(_src, function(javaImage, w, h) {
+                                          self._javaImage = javaImage;
+                                          self.naturalWidth = self.width = w;
+                                          self.naturalHeight = self.height = h;
+                                          self.complete = true;
+                                          if (typeof self.onload === 'function') {
+                                              try { self.onload.call(self); } catch (e) {}
+                                          }
+                                      }, function(err) {
+                                          self.complete = true;
+                                          if (typeof self.onerror === 'function') {
+                                              try { self.onerror.call(self); } catch (e) {}
+                                          }
+                                      });
+                                  }
+                              },
+                              enumerable: true,
+                              configurable: true
+                          });
+                      };
+                      Image.prototype = HTMLImageElement.prototype || {};
+                      Image[Symbol.hasInstance] = HTMLImageElement[Symbol.hasInstance];
+                  }
 
             if (typeof ShadowRoot === 'undefined') {
                 ShadowRoot = function() {};
@@ -1373,14 +1398,26 @@ public final class InstallBrowserCompat {
                 return fBound;
             }
 
-            // Normal JavaScript functions.
-            Function.prototype.bind = compatBind;
-
-            // Some Closure/Rhino callable objects do not inherit from
-            // Function.prototype. Give those objects the same fallback.
-            if (typeof Object.prototype.bind !== 'function') {
-                Object.prototype.bind = compatBind;
+            // Normal JavaScript functions. Define it NON-enumerable: a plain
+            // assignment makes `bind` show up in for-in loops over functions.
+            try {
+                Object.defineProperty(Function.prototype, 'bind', {
+                    value: compatBind,
+                    writable: true,
+                    configurable: true,
+                    enumerable: false
+                });
+            } catch (e) {
+                Function.prototype.bind = compatBind;
             }
+
+            // NEVER define bind on Object.prototype. Every plain object then
+            // "has" a bind property: reCAPTCHA reads params.bind (its invisible-
+            // widget option), found this function, switched to size=invisible and
+            // even serialized the polyfill's source into the anchor URL
+            // (&bind=function compatBind...). Java-implemented callables that lack
+            // Function.prototype are wrapped as ordinary JS functions instead
+            // (see JsBridge "native-function-wrap").
         })();
 
         // Closure Compiler helpers

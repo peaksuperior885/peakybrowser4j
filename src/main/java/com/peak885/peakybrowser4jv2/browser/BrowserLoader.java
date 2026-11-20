@@ -158,10 +158,7 @@ public final class BrowserLoader {
      */
     private static void dumpRawHtml(String url, String rawHtml) {
         try {
-            Path debugDir = new File(
-                    System.getProperty("java.io.tmpdir"),
-                    "peakybrowser-debug"
-            ).toPath();
+            Path debugDir = DiagnosticPaths.directory();
 
             Files.createDirectories(debugDir);
 
@@ -175,12 +172,21 @@ public final class BrowserLoader {
 
             Logger.info(
                     "[DEBUG] Dumped raw HTML for {} -> {}",
-                    url,
+                    safeDiagnosticUrl(url),
                     dumpFile.toAbsolutePath()
             );
 
         } catch (IOException e) {
             Logger.warn(e, "[DEBUG] Failed to dump raw HTML for {}", url);
+        }
+    }
+
+    private static String safeDiagnosticUrl(String value) {
+        try {
+            URI uri = URI.create(value);
+            return uri.getScheme() + "://" + uri.getAuthority() + uri.getPath();
+        } catch (RuntimeException e) {
+            return "unknown URL";
         }
     }
 
@@ -447,22 +453,24 @@ public final class BrowserLoader {
                         "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"
                 );
 
+        byte[] imageBytes = response.getBody();
+        Logger.info(
+                "[IMAGE-HTTP] request={}, status={} {}, finalUrl={}, contentType={}, contentLength={}, encoding={}, bytes={}, first16={}",
+                diagnosticUrl(imageUrl), response.getStatusCode(), response.getStatusMessage(),
+                diagnosticUrl(response.getFinalUrl()), response.getContentType(),
+                response.getHeader("content-length"), response.getHeader("content-encoding"),
+                imageBytes.length,
+                java.util.HexFormat.of().formatHex(imageBytes, 0, Math.min(imageBytes.length, 16))
+        );
+
         if (!response.isSuccessful()) {
-            throw new IOException(
-                    "HTTP " +
-                            response.getStatusCode() +
-                            " " +
-                            response.getStatusMessage()
-            );
+            throw new IOException("HTTP " + response.getStatusCode() + " " + response.getStatusMessage());
         }
 
-        ImageData image =
-                imageLoader.load(
-                        new ByteArrayInputStream(
-                                response.getBody()
-                        ),
-                        response.getContentType()
-                );
+        ImageData image = imageLoader.load(
+                new ByteArrayInputStream(imageBytes),
+                response.getContentType()
+        );
 
         ImageData existing =
                 imageCache.putIfAbsent(
@@ -473,6 +481,20 @@ public final class BrowserLoader {
         return existing == null
                 ? image
                 : existing;
+    }
+
+    private static String diagnosticUrl(String value) {
+        try {
+            URI uri = URI.create(value);
+            if ("data".equalsIgnoreCase(uri.getScheme())) {
+                int comma = value.indexOf(',');
+                return comma < 0 ? "data:<malformed>" : value.substring(0, comma) + ",<redacted>";
+            }
+            String query = uri.getRawQuery() == null ? "" : "?<redacted>";
+            return uri.getScheme() + "://" + uri.getRawAuthority() + uri.getRawPath() + query;
+        } catch (RuntimeException ignored) {
+            return "<unparseable-url>";
+        }
     }
 
     public String loadText(String url)

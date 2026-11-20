@@ -19,7 +19,11 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -57,6 +61,33 @@ public final class StyleResolver {
      * {@link Compound}.
      */
     private final Map<String, Compound> compoundCache = new ConcurrentHashMap<>();
+
+    /**
+     * Shared pool for parallel stylesheet fetches during a page load.
+     * Daemon threads so they never keep the JVM alive.
+     */
+    private static final ExecutorService CSS_FETCH_EXECUTOR =
+            Executors.newFixedThreadPool(
+                    Math.max(4, Runtime.getRuntime().availableProcessors()),
+                    r -> {
+                        Thread t = new Thread(r, "PeakyBrowser-CSS");
+                        t.setDaemon(true);
+                        return t;
+                    }
+            );
+
+    /**
+     * Short-lived text cache for stylesheet bodies keyed by absolute URL.
+     * Avoids re-fetching the same CSS when a page is rebuilt (resize, JS
+     * mutation, second tab to the same origin) within a few minutes.
+     * OkHttp still owns the real HTTP disk cache; this is just a hot path
+     * for the already-decoded text.
+     */
+    private static final Map<String, String> STYLESHEET_TEXT_CACHE =
+            new ConcurrentHashMap<>();
+
+    private static final int STYLESHEET_TEXT_CACHE_MAX = 64;
+
     public StyleResolver() {
         loadUserAgentStyles();
     }
@@ -217,9 +248,15 @@ public final class StyleResolver {
                                 .trim()
                                 .toLowerCase();
 
-                if (sel.contains(":root")
-                        || sel.equals("html")) {
+                // :root, html, and bare custom-property-only rules
+                boolean rootish =
+                        sel.contains(":root")
+                        || sel.equals("html")
+                        || sel.equals(":root")
+                        || sel.equals("html:root")
+                        || sel.equals("*");
 
+                if (rootish) {
                     for (CSSDeclaration decl :
                             rule.getAllDeclarations()) {
 
@@ -234,6 +271,13 @@ public final class StyleResolver {
                                     decl.getExpressionAsCSSString()
                             );
                         }
+                    }
+                }
+                // Also harvest --props from any rule (later used if set on body etc.)
+                for (CSSDeclaration decl : rule.getAllDeclarations()) {
+                    String prop = decl.getProperty();
+                    if (prop != null && prop.startsWith("--") && !properties.containsKey(prop)) {
+                        properties.put(prop, decl.getExpressionAsCSSString());
                     }
                 }
             }
@@ -266,7 +310,9 @@ public final class StyleResolver {
     }
 
     public ComputedStyle resolve(Element element, ComputedStyle parent) {
-        ComputedStyle style = new ComputedStyle();
+        // Always carry author :root custom properties so var(--x) resolves
+        // even when get() is called later during paint/layout.
+        ComputedStyle style = new ComputedStyle(customProperties);
 
         if (parent != null) {
             style.set("color", parent.get("color", "#000000"));
@@ -277,6 +323,8 @@ public final class StyleResolver {
             style.set("line-height", parent.get("line-height", "1.2"));
             // text-align is inherited (CSS 2.1 §14.2 / CSS Cascade)
             style.set("text-align", parent.get("text-align", "left"));
+            // white-space is inherited (CSS 2.1 §16.6)
+            style.set("white-space", parent.get("white-space", "normal"));
         }
 
         applyMatchingRules(element, uaRules, style);
@@ -380,7 +428,17 @@ public final class StyleResolver {
             for (CSSDeclaration decl : m.rule().getAllDeclarations()) {
                 String prop = decl.getProperty();
                 if (prop == null) continue;
-                style.set(prop, resolveVars(decl.getExpressionAsCSSString()));
+                String value = resolveVars(decl.getExpressionAsCSSString());
+                // Strip trailing !important so display/color/etc. compare cleanly.
+                // (We don't implement specificity for !important yet, but values
+                // like "none !important" must still parse as "none".)
+                if (value != null) {
+                    String trimmed = value.trim();
+                    if (trimmed.toLowerCase(Locale.ROOT).endsWith("!important")) {
+                        value = trimmed.substring(0, trimmed.length() - 10).trim();
+                    }
+                }
+                style.set(prop, value);
             }
         }
     }
@@ -805,7 +863,10 @@ public final class StyleResolver {
             case "em", "i" -> style.set("font-style", "italic");
             case "pre", "code" -> {
                 style.set("font-family", "monospace");
-                if (tag.equals("pre")) style.set("display", "block");
+                if (tag.equals("pre")) {
+                    if (style.get("display").isBlank()) style.set("display", "block");
+                    if (style.get("white-space").isBlank()) style.set("white-space", "pre");
+                }
             }
             case "hr" -> {
                 if (style.get("display").isBlank()) style.set("display", "block");
@@ -876,6 +937,60 @@ public final class StyleResolver {
         return loader.loadText(href);
     }
 
+    /**
+     * Like {@link #loadStylesheet} but hits a small in-process text cache
+     * first so repeated navigations / relayouts of the same page don't
+     * re-download CSS that OkHttp already served us once this session.
+     */
+    private static String loadStylesheetCached(String href, BrowserLoader loader)
+            throws Exception {
+        String cached = STYLESHEET_TEXT_CACHE.get(href);
+        if (cached != null) {
+            Logger.info("[CSS] text-cache HIT: {}", href);
+            return cached;
+        }
+
+        String body = loadStylesheet(href, loader);
+        if (body != null && !body.isBlank()) {
+            // Soft cap so the cache can't grow without bound on a long session.
+            if (STYLESHEET_TEXT_CACHE.size() >= STYLESHEET_TEXT_CACHE_MAX) {
+                // Drop an arbitrary entry; ConcurrentHashMap has no LRU, and
+                // this is only a hot cache on top of OkHttp's disk cache.
+                Iterator<String> it = STYLESHEET_TEXT_CACHE.keySet().iterator();
+                if (it.hasNext()) {
+                    it.next();
+                    it.remove();
+                }
+            }
+            STYLESHEET_TEXT_CACHE.put(href, body);
+        }
+        return body;
+    }
+
+    /**
+     * Returns true when a {@code <link rel=stylesheet>} is clearly not meant
+     * for interactive screen rendering (print, speech, etc.). Empty / missing
+     * / "all" / "screen" media are treated as screen.
+     */
+    private static boolean isNonScreenStylesheet(Element link) {
+        String media = link.attr("media");
+        if (media == null || media.isBlank()) {
+            return false;
+        }
+        String m = media.trim().toLowerCase(Locale.ROOT);
+        if (m.equals("all") || m.equals("screen") || m.contains("screen")) {
+            return false;
+        }
+        // Pure print / speech / aural / tty / etc.
+        return m.equals("print")
+                || m.equals("speech")
+                || m.equals("aural")
+                || m.equals("braille")
+                || m.equals("embossed")
+                || m.equals("tty")
+                || m.equals("tv");
+    }
+
     public static String collectAuthorCss(Document doc, BrowserLoader loader) {
         StringBuilder css = new StringBuilder();
 
@@ -904,11 +1019,23 @@ public final class StyleResolver {
             }
         }
 
-        // External CSS resources
+        // External CSS resources — fetch in parallel so multi-stylesheet pages
+        // don't pay sequential network latency on the critical path.
+        List<Element> stylesheetLinks = new ArrayList<>();
         for (Element link : doc.select("link")) {
             String rel = link.attr("rel");
-
             if (!rel.toLowerCase().contains("stylesheet")) {
+                continue;
+            }
+
+            // Skip stylesheets that are clearly not for screen rendering.
+            // media="print" / "speech" etc. used to be fetched and applied
+            // which wasted time and could override screen styles.
+            if (isNonScreenStylesheet(link)) {
+                Logger.info(
+                        "[CSS] skipping non-screen stylesheet: media={}",
+                        link.attr("media")
+                );
                 continue;
             }
 
@@ -916,37 +1043,62 @@ public final class StyleResolver {
             if (href.isBlank()) {
                 href = link.attr("href");
             }
-
             if (href.isBlank()) {
                 continue;
             }
-
             if (href.contains("google.com/xjs/_/ss/")) {
                 Logger.info("[CSS] skipping known empty Google stylesheet: {}", href);
                 continue;
             }
 
-            Logger.info("[CSS] discovered stylesheet: {}", href);
+            stylesheetLinks.add(link);
+        }
 
-            try {
-                String resource = loadStylesheet(href, loader);
+        if (!stylesheetLinks.isEmpty()) {
+            Logger.info(
+                    "[CSS] fetching {} stylesheet(s) in parallel",
+                    stylesheetLinks.size()
+            );
 
-                String extracted = extractCssDocument(resource);
+            List<CompletableFuture<String>> futures = new ArrayList<>(stylesheetLinks.size());
 
-                if (!extracted.isBlank()) {
-                    css.append(extracted).append('\n');
-                } else {
-                    Logger.warn(
-                            "[CSS] stylesheet contained no CSS: {}",
-                            href
-                    );
+            for (Element link : stylesheetLinks) {
+                String href = link.absUrl("href");
+                if (href.isBlank()) {
+                    href = link.attr("href");
                 }
-            } catch (Exception e) {
-                Logger.warn(
-                        "[CSS] failed to load stylesheet {}: {}",
-                        href,
-                        e.getMessage()
-                );
+                final String finalHref = href;
+
+                futures.add(CompletableFuture.supplyAsync(() -> {
+                    try {
+                        Logger.info("[CSS] discovered stylesheet: {}", finalHref);
+                        String resource = loadStylesheetCached(finalHref, loader);
+                        String extracted = extractCssDocument(resource);
+                        if (extracted.isBlank()) {
+                            Logger.warn("[CSS] stylesheet contained no CSS: {}", finalHref);
+                        }
+                        return extracted;
+                    } catch (Exception e) {
+                        Logger.warn(
+                                "[CSS] failed to load stylesheet {}: {}",
+                                finalHref,
+                                e.getMessage()
+                        );
+                        return "";
+                    }
+                }, CSS_FETCH_EXECUTOR));
+            }
+
+            // Preserve document order when concatenating so cascade stays correct.
+            for (CompletableFuture<String> future : futures) {
+                try {
+                    String extracted = future.get(20, TimeUnit.SECONDS);
+                    if (extracted != null && !extracted.isBlank()) {
+                        css.append(extracted).append('\n');
+                    }
+                } catch (Exception e) {
+                    Logger.warn("[CSS] stylesheet future failed: {}", e.getMessage());
+                }
             }
         }
 

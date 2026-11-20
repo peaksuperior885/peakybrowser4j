@@ -4,6 +4,7 @@ import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.peak885.peakybrowser4jv2.browser.cookiemonster.BiscuitJarAdapter;
 import com.peak885.peakybrowser4jv2.browser.cookiemonster.JsonBiscuitJar;
+import com.peak885.peakybrowser4jv2.browser.DiagnosticPaths;
 import okhttp3.*;
 
 import java.net.MalformedURLException;
@@ -120,10 +121,18 @@ public final class HttpManager {
          *
          * BiscuitJar handles persistent browser cookies.
          */
+        // Allow more concurrent requests per host than OkHttp's default of 5.
+        // Modern pages often pull 10+ assets from the same origin; raising
+        // this reduces queueing on CSS/image-heavy loads without going crazy.
+        okhttp3.Dispatcher dispatcher = new okhttp3.Dispatcher();
+        dispatcher.setMaxRequests(64);
+        dispatcher.setMaxRequestsPerHost(12);
+
         this.client = new OkHttpClient.Builder()
                 .protocols(Arrays.asList(Protocol.HTTP_2, Protocol.HTTP_1_1))
                 .followRedirects(true)
                 .followSslRedirects(true)
+                .dispatcher(dispatcher)
 
                 .connectTimeout(
                         Duration.ofSeconds(10)
@@ -270,14 +279,30 @@ public final class HttpManager {
         return directory;
     }
 
-    @NotNull
-    public HttpResponse get(
-            @NotNull String url
-    ) throws IOException {
-
-        return get(url, "*/*");
+    private static String decodeDataUriPayload(String payload) throws IOException {
+        java.io.ByteArrayOutputStream decoded = new java.io.ByteArrayOutputStream(payload.length());
+        for (int i = 0; i < payload.length();) {
+            char ch = payload.charAt(i);
+            if (ch == '%') {
+                if (i + 2 >= payload.length()) throw new IOException("Incomplete percent escape in data URI");
+                int high = Character.digit(payload.charAt(i + 1), 16);
+                int low = Character.digit(payload.charAt(i + 2), 16);
+                if (high < 0 || low < 0) throw new IOException("Invalid percent escape in data URI at offset " + i);
+                decoded.write((high << 4) | low);
+                i += 3;
+            } else {
+                int cp = payload.codePointAt(i);
+                decoded.write(new String(Character.toChars(cp)).getBytes(StandardCharsets.UTF_8));
+                i += Character.charCount(cp);
+            }
+        }
+        return decoded.toString(StandardCharsets.UTF_8);
     }
 
+    @NotNull
+    public HttpResponse get(@NotNull String url) throws IOException {
+        return get(url, "*/*");
+    }
     @NotNull
     public HttpResponse get(
             @NotNull String url,
@@ -294,11 +319,14 @@ public final class HttpManager {
                 String metadata = url.substring(5, commaIndex).toLowerCase(Locale.ROOT); // skip "data:"
                 String rawDataPart = url.substring(commaIndex + 1);
 
-                // 1. FIRST FIX: Always URL-decode the string data layer first to strip out %2F, %3D, etc.
-                String sanitizedDataPart = java.net.URLDecoder.decode(rawDataPart, StandardCharsets.UTF_8);
-
                 String contentType = "text/plain";
                 boolean isBase64 = metadata.contains(";base64");
+
+                // Base64 is already an ASCII-encoded binary representation. Do not
+                // URL-decode it: percent escapes and '+' are part of the payload.
+                String sanitizedDataPart = isBase64
+                        ? rawDataPart
+                        : decodeDataUriPayload(rawDataPart);
 
                 // Isolate the clean Content-Type segment
                 if (!metadata.isBlank()) {
@@ -308,12 +336,17 @@ public final class HttpManager {
                     }
                 }
 
-                // 2. Extract the decoded byte arrays safely
                 byte[] decodedBody;
                 if (isBase64) {
-                    // Strip any remaining inline whitespace format marks
                     String cleanBase64 = sanitizedDataPart.replaceAll("\\s", "");
                     decodedBody = java.util.Base64.getDecoder().decode(cleanBase64);
+
+                    Logger.info("[DATA-URI] Base64 length: {}", cleanBase64.length());
+                    Logger.info("[DATA-URI] Decoded length: {}", decodedBody.length);
+                    Logger.info("[DATA-URI] Prefix: {}",
+                            java.util.HexFormat.of().formatHex(
+                                    decodedBody, 0, Math.min(decodedBody.length, 16)
+                            ));
                 } else {
                     decodedBody = sanitizedDataPart.getBytes(StandardCharsets.UTF_8);
                 }
@@ -362,7 +395,7 @@ public final class HttpManager {
 
             Logger.info(
                     "[HTTP] Memory cache HIT: {}",
-                    url
+                    DiagnosticPaths.safeUrl(url)
             );
 
             return cachedResponse;
@@ -370,7 +403,7 @@ public final class HttpManager {
 
         Logger.debug(
                 "[HTTP] Memory cache MISS: {}",
-                url
+                DiagnosticPaths.safeUrl(url)
         );
 
         Request request = new Request.Builder()
@@ -454,7 +487,7 @@ public final class HttpManager {
         Logger.info(
                 "[HTTP] {} {}",
                 request.method(),
-                request.url()
+                DiagnosticPaths.safeUrl(request.url().toString())
         );
 
         for (String name : request.headers().names()) {
@@ -462,7 +495,7 @@ public final class HttpManager {
             Logger.debug(
                     "[HTTP] Request header: {}: {}",
                     name,
-                    request.header(name)
+                    DiagnosticPaths.safeHeaderValue(name, request.header(name))
             );
         }
 
@@ -477,7 +510,7 @@ public final class HttpManager {
 
             Logger.info(
                     "[HTTP] Final URL: {}",
-                    response.request().url()
+                    DiagnosticPaths.safeUrl(response.request().url().toString())
             );
 
             Logger.info(
@@ -858,7 +891,7 @@ public final class HttpManager {
         Logger.info(
                 "[HTTP] Streaming {} {}",
                 request.method(),
-                request.url()
+                DiagnosticPaths.safeUrl(request.url().toString())
         );
 
         Response response = client.newCall(request).execute();
@@ -866,14 +899,14 @@ public final class HttpManager {
         Logger.info(
                 "[HTTP] Streaming {} {}",
                 request.method(),
-                request.url()
+                DiagnosticPaths.safeUrl(request.url().toString())
         );
 
         for (String name : request.headers().names()) {
             Logger.info(
                     "[HTTP] Streaming request header: {}: {}",
                     name,
-                    request.header(name)
+                    DiagnosticPaths.safeHeaderValue(name, request.header(name))
             );
         }
 
@@ -885,7 +918,7 @@ public final class HttpManager {
 
         Logger.info(
                 "[HTTP] Final URL: {}",
-                response.request().url()
+                DiagnosticPaths.safeUrl(response.request().url().toString())
         );
 
         Logger.info(

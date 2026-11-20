@@ -1,6 +1,9 @@
 package com.peak885.peakybrowser4jv2.browser.js;
 
+import com.peak885.peakybrowser4jv2.browser.BrowserLoader;
+import com.peak885.peakybrowser4jv2.browser.DiagnosticPaths;
 import com.peak885.peakybrowser4jv2.browser.http.HttpManager;
+import com.peak885.peakybrowser4jv2.browser.image.ImageData;
 import com.peak885.peakybrowser4jv2.browser.js.processing.JsPreprocessor;
 import org.jsoup.nodes.Document;
 import org.jsoup.nodes.Element;
@@ -22,6 +25,7 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -89,15 +93,60 @@ public final class JsBridge {
             this.expando = javaObject instanceof ExpandoHost host
                     ? host.expandoMap()
                     : java.util.Collections.synchronizedMap(new HashMap<>());
+
+            // Point the prototype chain at the appropriate DOM constructor prototype so
+            // `node instanceof Element` / `instanceof Node` / `instanceof HTMLElement`
+            // succeed. reCAPTCHA rejects containers that fail these checks.
+            if (scope != null && javaObject instanceof JsNode jsNode) {
+                Scriptable proto = findDomPrototype(scope, "Element");
+                if (proto == null) proto = findDomPrototype(scope, "Node");
+                if (proto != null) setPrototype(proto);
+                // nodeType is served from get() as a primitive double — see below.
+            } else if (scope != null && javaObject instanceof JsDocument) {
+                Scriptable proto = findDomPrototype(scope, "Document");
+                if (proto != null) setPrototype(proto);
+            }
+        }
+
+        /** Return a real JS number for nodeType so {@code nodeType == 1} works. */
+        private Object nodeTypeValue() {
+            Object javaObj = javaObject;
+            if (javaObj instanceof JsNode n) {
+                return Double.valueOf(n.getNodeType());
+            }
+            if (javaObj instanceof JsDocument) {
+                return Double.valueOf(9); // DOCUMENT_NODE
+            }
+            return Double.valueOf(0);
+        }
+
+        private static Scriptable findDomPrototype(Scriptable scope, String ctorName) {
+            try {
+                Object ctor = ScriptableObject.getProperty(scope, ctorName);
+                if (ctor instanceof Scriptable ctorObj) {
+                    Object proto = ScriptableObject.getProperty(ctorObj, "prototype");
+                    if (proto instanceof Scriptable p) return p;
+                }
+            } catch (Exception ignored) {
+            }
+            return null;
         }
 
         @Override
         public boolean has(String name, Scriptable start) {
+            if ("nodeType".equals(name) && (javaObject instanceof JsNode || javaObject instanceof JsDocument)) {
+                return true;
+            }
             return expando.containsKey(name) || super.has(name, start);
         }
 
         @Override
         public Object get(String name, Scriptable start) {
+            // Always return a primitive JS number for nodeType. Critical for
+            // reCAPTCHA: `m[7](…, el) && el.nodeType == 1` must succeed.
+            if ("nodeType".equals(name) && (javaObject instanceof JsNode || javaObject instanceof JsDocument)) {
+                return nodeTypeValue();
+            }
             synchronized (expando) {
                 if (expando.containsKey(name)) {
                     return expando.get(name);
@@ -186,6 +235,7 @@ public final class JsBridge {
     private final Map<Long, ScheduledFuture<?>> scheduledTasks = new ConcurrentHashMap<>();
     private final AtomicLong nextTaskId = new AtomicLong();
     private final AtomicReference<Element> currentScriptElement = new AtomicReference<>();
+    private final AtomicInteger pendingDynamicScripts = new AtomicInteger();
     private java.util.function.Consumer<String> onNavigate;
 
     private Scriptable scope;
@@ -196,9 +246,20 @@ public final class JsBridge {
     private boolean initialized;
     private volatile boolean closed;
 
+    private final BrowserLoader browserLoader;
+
+    // Processed source of every named script this page executed, so an error reported
+    // against recaptcha__en.js line 1544 is looked up in THAT script - not in whichever
+    // script was running (e.g. a small inline init that merely called into the bundle).
+    private final Map<String, String> executedSources = new ConcurrentHashMap<>();
+    private final java.util.Set<String> dumpedFailingSources = ConcurrentHashMap.newKeySet();
+    private volatile boolean parserFinished;
+    private volatile boolean loadEventDispatched;
+
     public JsBridge(Document document, HttpManager http, Runnable layoutInvalidator) {
         this.document = document;
         this.http = http;
+        this.browserLoader = new BrowserLoader(http);
         this.layoutInvalidator = layoutInvalidator != null
                 ? () -> javax.swing.SwingUtilities.invokeLater(layoutInvalidator)
                 : () -> {};
@@ -268,16 +329,59 @@ public final class JsBridge {
                 }
             };
 
+            // Inside initialize(), where other global properties are registered:
+            ScriptableObject.putProperty(scope, "__nativeImageFetch", new BaseFunction() {
+                @Override
+                public Object call(Context cx, Scriptable scope, Scriptable thisObj, Object[] args) {
+                    if (args.length < 3) return Undefined.instance;
+                    String url = Context.toString(args[0]);
+                    Function onSuccess = (Function) args[1];
+                    Function onError = (Function) args[2];
+
+                    taskExecutor.execute(() -> {
+                        try {
+                            ImageData imageData = browserLoader.loadImage(url);
+                            java.awt.image.BufferedImage bufImg = imageData.firstFrame();
+
+                            Context callCx = ContextFactory.getGlobal().enterContext();
+                            try {
+                                synchronized (javascriptLock) {
+                                    onSuccess.call(callCx, scope, scope, new Object[]{
+                                            Context.javaToJS(bufImg, scope),
+                                            bufImg.getWidth(),
+                                            bufImg.getHeight()
+                                    });
+                                }
+                            } finally {
+                                Context.exit();
+                            }
+                        } catch (Exception e) {
+                            Context callCx = ContextFactory.getGlobal().enterContext();
+                            try {
+                                synchronized (javascriptLock) {
+                                    onError.call(callCx, scope, scope, new Object[]{e.getMessage()});
+                                }
+                            } finally {
+                                Context.exit();
+                            }
+                        }
+                    });
+                    return Undefined.instance;
+                }
+            });
+
             nodeCtx = new JsNode.Ctx(layoutInvalidator, invoker);
+            nodeCtx.setGlobalScope(scope);
             nodeCtx.setScriptInsertedListener(this::onScriptInserted);
 
             JsDocument jsDocument =
                     new JsDocument(document, nodeCtx, currentScriptElement);
 
             documentObject = jsDocument;
+            nodeCtx.setDocument(jsDocument);
             jsDocument.setCookieAccess(http.getClient().cookieJar(), getDocumentUrl());
 
-            JsConsole jsConsole = new JsConsole();
+            JsConsole jsConsole = new JsConsole(getDocumentUrl());
             JsNavigator jsNavigator = new JsNavigator();
 
             location = new JsLocation(getDocumentUrl(), getDocumentUrl(), targetUrl -> {
@@ -299,6 +403,7 @@ public final class JsBridge {
 
             putGlobal(cx, "document", jsDocument);
             putGlobal(cx, "console", jsConsole);
+            RecaptchaClosureCompat.installEvalPatch(cx, scope);
 
             // Google's challenge catches errors thrown by its generated eval source and
             // serializes the stack into sg_ss, so execute() never sees the exception and its
@@ -314,7 +419,7 @@ public final class JsBridge {
                 public Object call(Context c, Scriptable s2, Scriptable thisObj, Object[] args) {
                     try {
                         if (args.length >= 2) {
-                            Path dir = Path.of(System.getProperty("java.io.tmpdir"), "peakybrowser-debug");
+                            Path dir = DiagnosticPaths.directory();
                             Files.createDirectories(dir);
                             String source = Context.toString(args[1]);
                             Path file = dir.resolve("eval-" + Context.toString(args[0]) + ".js");
@@ -328,6 +433,27 @@ public final class JsBridge {
                     return Undefined.instance;
                 }
             });
+
+            ScriptableObject.putProperty(scope, "getComputedStyle", new BaseFunction() {
+                @Override
+                public Object call(Context cx, Scriptable scope, Scriptable thisObj, Object[] args) {
+                    Scriptable style = cx.newObject(scope);
+                    ScriptableObject.putProperty(style, "getPropertyValue", new BaseFunction() {
+                        @Override
+                        public Object call(Context cx2, Scriptable s, Scriptable t, Object[] a) {
+                            return "";          // or real values later
+                        }
+                    });
+
+                    ScriptableObject.putProperty(style, "display", "block");
+                    ScriptableObject.putProperty(style, "visibility", "visible");
+                    ScriptableObject.putProperty(style, "opacity", "1");
+                    ScriptableObject.putProperty(style, "width", "0px");
+                    ScriptableObject.putProperty(style, "height", "0px");
+                    return style;
+                }
+            });
+
             cx.evaluateString(scope, """
                     (function () {
                       var nativeEval = eval;
@@ -344,7 +470,11 @@ public final class JsBridge {
 
                       function diagnose(error, source, id) {
                         var msg = String((error && error.message) || error);
-                        console.warn('[EVAL-DIAG] eval #' + id + ' threw: ' + msg);
+                        var name = String((error && error.name) || 'Error');
+                        var stack = String((error && error.stack) || '');
+                        console.error('[RECAPTCHA-EVAL] generated eval #' + id
+                          + ' threw ' + name + ': ' + msg
+                          + (stack ? '\\n' + stack.slice(0, 1800) : ''));
                         var m = /Cannot (set|read) propert(?:y|ies) "?([A-Za-z_$][\\w$]*)"? of (undefined|null)/.exec(msg);
                         if (!m) return;
                         var isSet = m[1] === 'set';
@@ -390,14 +520,7 @@ public final class JsBridge {
                         }
                         var id = ++evalCount;
                         try { if (typeof __peakyDumpEval === 'function') __peakyDumpEval(id, source); } catch (e) {}
-                        var guardedCalls = 0;
-                        source = source.replace(/MB\\(51,37,a,U\\[m\\]\\)/g, function (call) {
-                          guardedCalls++;
-                          return '(U[m] == null ? void 0 : ' + call + ')';
-                        });
-                        if (guardedCalls) {
-                          console.warn('[EVAL-PATCH] guarded ' + guardedCalls + ' Google listener cleanup call(s) with a missing U[m] entry');
-                        }
+                        source = __peakyPatchRecaptchaEval(source);
                         try {
                           return (0, nativeEval)(source);
                         } catch (e) {
@@ -433,6 +556,56 @@ public final class JsBridge {
 
             installBrowserCompat.installBrowserCompatibility(cx, scope);
 
+            // DOM host constructors + Symbol.hasInstance so that
+            // `node instanceof Element` / `instanceof Node` succeed for our
+            // Rhino-wrapped JsNode objects. reCAPTCHA throws
+            // "The bind parameter must be an element or id" without this.
+            cx.evaluateString(scope, """
+                (function (g) {
+                  function isHostNode(x) {
+                    try {
+                      return x != null
+                          && typeof x.nodeType === 'number'
+                          && (typeof x.getAttribute === 'function'
+                              || typeof x.appendChild === 'function'
+                              || typeof x.tagName === 'string');
+                    } catch (e) { return false; }
+                  }
+                  function installCtor(name, test) {
+                    if (typeof g[name] !== 'function') {
+                      g[name] = function () {
+                        throw new TypeError('Illegal constructor');
+                      };
+                    }
+                    if (typeof Symbol !== 'undefined' && Symbol.hasInstance) {
+                      try {
+                        Object.defineProperty(g[name], Symbol.hasInstance, {
+                          configurable: true,
+                          value: function (instance) { return test(instance); }
+                        });
+                      } catch (e) {}
+                    }
+                  }
+                  installCtor('Node', isHostNode);
+                  installCtor('Element', function (x) {
+                    return isHostNode(x) && x.nodeType === 1;
+                  });
+                  installCtor('HTMLElement', function (x) {
+                    return isHostNode(x) && x.nodeType === 1;
+                  });
+                  installCtor('HTMLDivElement', function (x) {
+                    return isHostNode(x) && x.nodeType === 1
+                        && String(x.tagName || '').toUpperCase() === 'DIV';
+                  });
+                  installCtor('Document', function (x) {
+                    try {
+                      return x != null && typeof x.getElementById === 'function'
+                          && typeof x.createElement === 'function';
+                    } catch (e) { return false; }
+                  });
+                })(typeof globalThis !== 'undefined' ? globalThis : this);
+                """, "dom-host-instanceof", 1, null);
+
             // ------------------------------------------------------------------
             // EventTarget polyfill – required by reCAPTCHA (and many other
             // challenge scripts).  Without addEventListener / attachEvent on
@@ -444,15 +617,65 @@ public final class JsBridge {
             cx.evaluateString(scope, """
                 (function () {
                   function ensureEventTarget(target) {
-                    if (!target || typeof target !== 'object') return;
+                    if (!target || (typeof target !== 'object' && typeof target !== 'function')) return;
                     if (typeof target.addEventListener !== 'function') {
                       target.addEventListener = function (type, listener, options) {
-                        // No-op fallback. Real delivery is handled by JsNode
-                        // when the underlying Java object implements the method.
+                        if (!listener) return;
+                        var key = '__peakyListeners_' + String(type);
+                        var list = this[key] || (this[key] = []);
+                        if (list.indexOf(listener) < 0) list.push(listener);
                       };
                     }
+                    if (typeof globalThis.Worker === 'undefined') {
+                            globalThis.Worker = function(stringUrl) {
+                                this.url = stringUrl;
+                                this.onmessage = null;
+                            };
+                            globalThis.Worker.prototype.postMessage = function(msg) {
+                                // Mock implementation or fallback behavior for reCAPTCHA background tasks
+                            };
+                            globalThis.Worker.prototype.terminate = function() {};
+                        }
+                        if (typeof globalThis.btoa === 'undefined') {
+                                globalThis.btoa = function (input) {
+                                    var str = String(input);
+                                    var chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=';
+                                    var output = '';
+                                    for (var block = 0, charCode, i = 0, map = chars;
+                                         str.charAt(i | 0) || (map = '=', i % 1);
+                                         output += map.charAt(63 & (block >> (8 - (i % 1) * 8)))) {
+                                        charCode = str.charCodeAt(i += 3/4);
+                                        if (charCode > 0xFF) {
+                                            throw new Error("'btoa' failed: The string to be encoded contains characters outside of the Latin1 range.");
+                                        }
+                                        block = (block << 8) | charCode;
+                                    }
+                                    return output;
+                                };
+                            }
+                    
+                            if (typeof globalThis.atob === 'undefined') {
+                                globalThis.atob = function (input) {
+                                    var str = String(input).replace(/=+$/, '');
+                                    var chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=';
+                                    if (str.length % 4 == 1) {
+                                        throw new Error("'atob' failed: The string to be decoded is not correctly encoded.");
+                                    }
+                                    var output = '';
+                                    for (var bc = 0, bs = 0, buffer, i = 0;
+                                         buffer = str.charAt(i++);
+                                         ~buffer && (bs = bc % 4 ? bs * 64 + buffer : buffer,
+                                             bc++ % 4) ? output += String.fromCharCode(255 & bs >> (-2 * bc & 6)) : 0) {
+                                        buffer = chars.indexOf(buffer);
+                                    }
+                                    return output;
+                                };
+                            }
                     if (typeof target.removeEventListener !== 'function') {
-                      target.removeEventListener = function (type, listener, options) {};
+                      target.removeEventListener = function (type, listener, options) {
+                        var list = this['__peakyListeners_' + String(type)];
+                        if (list) { var i = list.indexOf(listener); if (i >= 0) list.splice(i, 1); }
+                      };
                     }
                     if (typeof target.attachEvent !== 'function') {
                       target.attachEvent = function (type, listener) {
@@ -469,7 +692,23 @@ public final class JsBridge {
                       };
                     }
                     if (typeof target.dispatchEvent !== 'function') {
-                      target.dispatchEvent = function (evt) { return true; };
+                      target.dispatchEvent = function (evt) {
+                        if (!evt || !evt.type) return true;
+                        var type = String(evt.type), list = this['__peakyListeners_' + type];
+                        if (!evt.target) evt.target = this;
+                        evt.currentTarget = this;
+                        if (list) list.slice().forEach(function (fn) {
+                          try { if (typeof fn === 'function') fn.call(target, evt);
+                               else if (fn && typeof fn.handleEvent === 'function') fn.handleEvent(evt); }
+                          catch (e) { try { console.warn('Event listener failed', e); } catch (_) {} }
+                        });
+                        var handler = this['on' + type];
+                        if (typeof handler === 'function') {
+                          try { handler.call(this, evt); }
+                          catch (e) { try { console.warn('Event handler failed', e); } catch (_) {} }
+                        }
+                        return !evt.defaultPrevented;
+                      };
                     }
                   }
 
@@ -478,6 +717,13 @@ public final class JsBridge {
                   ensureEventTarget(self);
                   ensureEventTarget(top);
                   ensureEventTarget(parent);
+
+                  // Our bind compatibility wrapper can be used by Closure as an
+                  // event target. Give those callable host wrappers per-instance
+                  // listener storage through the normal Function prototype chain.
+                  if (typeof Function === 'function' && Function.prototype) {
+                    ensureEventTarget(Function.prototype);
+                  }
 
                   // document
                   if (typeof document !== 'undefined') {
@@ -583,50 +829,25 @@ public final class JsBridge {
             // fetch(), timers, etc.
             installAsyncFunctions(jsFetchHelper);
 
-            // ---- challenge probe (diagnostics only; must run after timers exist) ----
-            try {
-                cx.evaluateString(scope, """
-                (function () {
-                  function L(m) { try { console.log('[PROBE] ' + m); } catch (e) {} }
-                  try {
-                    if (typeof Image === 'function') {
-                      var Orig = Image;
-                      Image = function (w, h) {
-                        var img = new Orig(w, h);
-                        var d = Object.getOwnPropertyDescriptor(img, 'src');
-                        if (d && d.set) {
-                          Object.defineProperty(img, 'src', {
-                            get: d.get, configurable: true,
-                            set: function (v) { L('Image.src = ' + v); d.set.call(img, v); }
-                          });
-                        }
-                        // Ensure the instance itself has EventTarget methods
-                        // (prototype polyfill may not always be visible).
-                        if (typeof img.addEventListener !== 'function') {
-                          img.addEventListener = function () {};
-                          img.removeEventListener = function () {};
-                          img.attachEvent = function () {};
-                          img.detachEvent = function () {};
-                          img.dispatchEvent = function () { return true; };
-                        }
-                        return img;
+            // Java-implemented globals (setTimeout, fetch, ...) are BaseFunction objects
+            // that don't inherit from Function.prototype, so they have no bind/call/apply.
+            // Wrap them as ordinary JS functions rather than polluting Object.prototype.
+            cx.evaluateString(scope, """
+                (function (g) {
+                  var names = Object.getOwnPropertyNames(g);
+                  for (var i = 0; i < names.length; i++) {
+                    var name = names[i], fn;
+                    try { fn = g[name]; } catch (e) { continue; }
+                    if (typeof fn !== 'function' || typeof fn.bind === 'function') continue;
+                    (function (name, nativeFn) {
+                      var wrapper = function () {
+                        return Function.prototype.apply.call(nativeFn, g, arguments);
                       };
-                      Image.prototype = Orig.prototype;
-                    }
-                  } catch (e) { L('Image wrap failed: ' + e); }
-                  [1500, 3000, 6000].forEach(function (ms) {
-                    setTimeout(function () {
-                      var ks = window.knitsail;
-                      L('t+' + ms + 'ms knitsail=' + typeof ks
-                        + ' knitsail.a=' + (ks ? typeof ks.a : 'n/a')
-                        + ' cookie=' + String(document.cookie).replace(/(SG_SS=.{12}).*/, '$1...'));
-                    }, ms);
-                  });
-                })();
-                """, "challenge-probe", 1, null);
-            } catch (Throwable probeError) {
-                Logger.warn(probeError, "[PROBE] install failed (ignored)");
-            }
+                      try { g[name] = wrapper; } catch (e) {}
+                    })(name, fn);
+                  }
+                })(typeof globalThis !== 'undefined' ? globalThis : this);
+                """, "native-function-wrap", 1, null);
 
             initialized = true;
 
@@ -669,7 +890,7 @@ public final class JsBridge {
         final String processed;
 
         if (shouldSkipPreprocessing(scriptUrl)) {
-            processed = applyRecaptchaCompatibility(script);
+            processed = RecaptchaClosureCompat.prepareBundle(script, this::installJsPolyfillsAndHelpers);
             Logger.info("[JS] Skipping general preprocessing for: {}", scriptUrl);
         } else {
             processed = JsPreprocessor.process(script);
@@ -680,6 +901,9 @@ public final class JsBridge {
         }
 
         logScriptWithLineNumbers(processed);
+        if (scriptUrl != null) {
+            executedSources.put(scriptUrl, processed);
+        }
 
         Context cx = null;
         try {
@@ -738,31 +962,142 @@ public final class JsBridge {
         }
     }
 
-    private void logScriptError(Throwable e, String script) {
+    private void logScriptError(Throwable e, String runningScript) {
         String message = e.getMessage();
         Logger.warn("Rhino JavaScript error: {}",
                 message == null ? e.getClass().getSimpleName() : message);
 
         if (e instanceof org.mozilla.javascript.RhinoException rhino) {
-            Logger.warn("Rhino source: {}", rhino.sourceName());
+            String sourceName = rhino.sourceName();
+            int line = Math.max(1, rhino.lineNumber());
+            Logger.warn("Rhino source: {}", sourceName);
             Logger.warn("Rhino line: {}", rhino.lineNumber());
-            if (script != null && !script.isBlank()) {
-                logContextAroundLine(script, Math.max(1, rhino.lineNumber()));
+
+            // The failing function may live in a different script than the one that was
+            // running when it was called, so prefer the script the error names.
+            String source = sourceName != null ? executedSources.get(sourceName) : null;
+            if (source == null) {
+                source = runningScript;
+            }
+            if (source != null && !source.isBlank()) {
+                dumpFailingScript(sourceName, source);
+                logContextAroundLine(source, line, failingIdentifier(message));
             }
         }
 
         Logger.warn(e, "JS execution failed");
     }
 
-    private void logContextAroundLine(String script, int lineNumber) {
-        String[] lines = script.split("\\R", -1);
-        int start = Math.max(0, lineNumber - 4);
-        int end = Math.min(lines.length, lineNumber + 3);
+    /** Pull the identifier out of "X is not a function" / "Cannot read property \"X\"" messages. */
+    private static String failingIdentifier(String message) {
+        if (message == null) {
+            return null;
+        }
+        Matcher m = Pattern.compile("([A-Za-z_$][\\w$]*) is not a (?:function|constructor)").matcher(message);
+        if (m.find()) {
+            return m.group(1);
+        }
+        m = Pattern.compile("Cannot (?:read|set) propert(?:y|ies) \"?([A-Za-z_$][\\w$]*)\"?").matcher(message);
+        if (m.find()) {
+            return m.group(1);
+        }
+        return null;
+    }
 
-        Logger.warn("JavaScript around failing line:");
-        for (int i = start; i < end; i++) {
-            String marker = (i + 1 == lineNumber) ? " >>> " : "     ";
-            Logger.warn("{}{:04d}: {}", marker, i + 1, lines[i]);
+    /** Write the script that actually failed to %TEMP%/peakybrowser-debug so it can be inspected/shared. */
+    private void dumpFailingScript(String sourceName, String source) {
+        String key = sourceName == null ? "page-script" : sourceName;
+        if (!dumpedFailingSources.add(key)) {
+            return;
+        }
+        try {
+            String safe = key.replaceAll("[^A-Za-z0-9._-]", "_");
+            if (safe.length() > 80) {
+                safe = safe.substring(safe.length() - 80);
+            }
+            Path dir = DiagnosticPaths.directory();
+            Files.createDirectories(dir);
+            Path file = dir.resolve("failing-" + safe + ".js");
+            Files.writeString(file, source, StandardCharsets.UTF_8);
+            Logger.warn("[JS-DIAG] dumped failing script ({} chars) -> {}", source.length(), file.toAbsolutePath());
+        } catch (Throwable t) {
+            Logger.warn(t, "[JS-DIAG] could not dump failing script");
+        }
+    }
+
+    private static boolean isIdentChar(char c) {
+        return Character.isLetterOrDigit(c) || c == '_' || c == '$';
+    }
+
+    private void logContextAroundLine(String script, int lineNumber, String identifier) {
+        String[] lines = script.split("\\R", -1);
+
+        Logger.warn("JavaScript around failing line {} (script has {} lines, {} chars):",
+                lineNumber, lines.length, script.length());
+
+        if (lineNumber <= lines.length) {
+            int start = Math.max(0, lineNumber - 3);
+            int end = Math.min(lines.length, lineNumber + 2);
+            for (int i = start; i < end; i++) {
+                String marker = (i + 1 == lineNumber) ? " >>> " : "     ";
+                String text = lines[i].length() > 1500 ? lines[i].substring(0, 1500) + "...(cut)" : lines[i];
+                Logger.warn("{}{}: {}", marker, String.format("%04d", i + 1), text);
+            }
+        } else {
+            Logger.warn("Reported line {} is outside this script.", lineNumber);
+        }
+
+        if (identifier == null) {
+            return;
+        }
+
+        // Where is the failing identifier DEFINED, and where is it used on the failing line?
+        int definitions = 0;
+        int usages = 0;
+        int from = 0;
+        while (definitions + usages < 40) {
+            int index = script.indexOf(identifier, from);
+            if (index < 0) {
+                break;
+            }
+            from = index + identifier.length();
+            boolean startOk = index == 0 || !isIdentChar(script.charAt(index - 1));
+            boolean endOk = from >= script.length() || !isIdentChar(script.charAt(from));
+            if (!startOk || !endOk) {
+                continue;
+            }
+
+            int j = from;
+            while (j < script.length() && Character.isWhitespace(script.charAt(j))) {
+                j++;
+            }
+            boolean assigned = j < script.length() && script.charAt(j) == '='
+                    && (j + 1 >= script.length() || script.charAt(j + 1) != '=');
+            boolean declared = index >= 9 && script.startsWith("function ", index - 9);
+            boolean varDecl = index >= 4 && script.startsWith("var ", index - 4);
+
+            int line = 1;
+            for (int i = 0; i < index; i++) {
+                if (script.charAt(i) == '\n') {
+                    line++;
+                }
+            }
+
+            boolean isDefinition = assigned || declared || varDecl;
+            if (isDefinition && definitions < 8) {
+                definitions++;
+                Logger.warn("[{} DEFINITION {}] line={}: {}", identifier, definitions, line,
+                        script.substring(Math.max(0, index - 120), Math.min(script.length(), index + 260)));
+            } else if (!isDefinition && line == lineNumber && usages < 4) {
+                usages++;
+                Logger.warn("[{} USE {}] line={}: {}", identifier, usages, line,
+                        script.substring(Math.max(0, index - 200), Math.min(script.length(), index + 120)));
+            }
+        }
+
+        if (definitions == 0) {
+            Logger.warn("[{}] has NO assignment/declaration anywhere in this script - it must come from the "
+                    + "environment (a missing global/API) or from another script.", identifier);
         }
     }
 
@@ -825,6 +1160,7 @@ public final class JsBridge {
         }
 
         Logger.info("[DYN-SCRIPT] loading {}", resolved);
+        pendingDynamicScripts.incrementAndGet();
         scriptLoader.execute(() -> {
             try {
                 HttpManager.HttpResponse response = http.get(
@@ -849,6 +1185,11 @@ public final class JsBridge {
             } catch (Throwable t) {
                 Logger.warn(t, "[DYN-SCRIPT] failed {}", resolved);
                 fireScriptEvent(script, "error");
+            } finally {
+                if (pendingDynamicScripts.decrementAndGet() < 0) {
+                    pendingDynamicScripts.set(0);
+                }
+                maybeDispatchPageLoad();
             }
         });
     }
@@ -939,7 +1280,43 @@ public final class JsBridge {
             }
         }
         if (documentObject != null) {
+            documentObject.setReadyState("interactive");
             documentObject.dispatchDOMContentLoaded();
+            parserFinished = true;
+            maybeDispatchPageLoad();
+        }
+    }
+
+    /** Fire window/document load once parsing and inserted external scripts finish. */
+    private void maybeDispatchPageLoad() {
+        if (!parserFinished || pendingDynamicScripts.get() != 0 || loadEventDispatched || closed) return;
+        synchronized (javascriptLock) {
+            if (!parserFinished || pendingDynamicScripts.get() != 0 || loadEventDispatched || closed) return;
+            loadEventDispatched = true;
+            if (documentObject != null) {
+                documentObject.setReadyState("complete");
+                documentObject.dispatchEvent("load", null);
+            }
+            dispatchWindowEvent("load");
+            Logger.info("[JS-LIFECYCLE] document readyState=complete; dispatched window load");
+        }
+    }
+
+    private void dispatchWindowEvent(String type) {
+        Context cx = null;
+        try {
+            cx = ContextFactory.getGlobal().enterContext();
+            cx.setLanguageVersion(Context.VERSION_ES6);
+            cx.setOptimizationLevel(-1);
+            ScriptableObject.putProperty(scope, "__peakyLifecycleEventType", type);
+            cx.evaluateString(scope,
+                    "window.dispatchEvent({type:String(__peakyLifecycleEventType), target:window});",
+                    "window-lifecycle-event", 1, null);
+        } catch (Throwable t) {
+            Logger.warn(t, "[JS-LIFECYCLE] could not dispatch window {} event", type);
+        } finally {
+            if (scope != null) ScriptableObject.deleteProperty(scope, "__peakyLifecycleEventType");
+            if (cx != null) Context.exit();
         }
     }
 
@@ -1182,21 +1559,120 @@ public final class JsBridge {
 
     private org.mozilla.javascript.Function fetchFunction(JsFetch jsFetch) {
         return new org.mozilla.javascript.BaseFunction() {
-            @Override public Object call(Context cx, Scriptable ignored, Scriptable thisObj, Object[] args) {
-                if (args.length == 0 || args[0] == null) throw Context.reportRuntimeError("TypeError: Failed to execute 'fetch': at least 1 argument required.");
-                String url = Context.toString(args[0]);
+            @Override
+            public Object call(Context cx, Scriptable ignored, Scriptable thisObj, Object[] args) {
+                if (args.length == 0 || args[0] == null) {
+                    throw Context.reportRuntimeError(
+                            "TypeError: Failed to execute 'fetch': at least 1 argument required.");
+                }
+
+                // ---- parse input (url or Request-like object) ----
+                String url;
+                String method = "GET";
+                Map<String, String> headers = new LinkedHashMap<>();
+                String body = null;
+
+                Object input = args[0];
+                if (input instanceof Scriptable inputObj
+                        && ScriptableObject.hasProperty(inputObj, "url")) {
+                    // fetch(Request)
+                    url = Context.toString(ScriptableObject.getProperty(inputObj, "url"));
+                    Object m = ScriptableObject.getProperty(inputObj, "method");
+                    if (m != null && m != Undefined.instance) {
+                        method = Context.toString(m);
+                    }
+                    Object h = ScriptableObject.getProperty(inputObj, "headers");
+                    extractHeaders(h, headers);
+                    Object b = ScriptableObject.getProperty(inputObj, "body");
+                    if (b != null && b != Undefined.instance) {
+                        body = Context.toString(b);
+                    }
+                } else {
+                    url = Context.toString(input);
+                }
+
+                // ---- parse init options (second argument) ----
+                if (args.length > 1 && args[1] instanceof Scriptable init) {
+                    Object m = ScriptableObject.getProperty(init, "method");
+                    if (m != null && m != Undefined.instance) {
+                        method = Context.toString(m);
+                    }
+
+                    Object h = ScriptableObject.getProperty(init, "headers");
+                    extractHeaders(h, headers);
+
+                    Object b = ScriptableObject.getProperty(init, "body");
+                    if (b != null && b != Undefined.instance && b != null) {
+                        body = Context.toString(b);
+                    }
+                }
+
+                final String fUrl = url;
+                final String fMethod = method;
+                final Map<String, String> fHeaders = headers;
+                final String fBody = body;
+
+                Logger.info("[JS fetch] CALL method={} url={} headers={} bodyLen={}",
+                        fMethod, fUrl, fHeaders.size(),
+                        fBody == null ? 0 : fBody.length());
+
                 Scriptable deferred = (Scriptable) cx.evaluateString(scope,
                         "(function(){var resolve,reject;var promise=new Promise(function(r,j){resolve=r;reject=j;});return {promise:promise,resolve:resolve,reject:reject};})()",
                         "fetch-promise", 1, null);
-                org.mozilla.javascript.Function resolve = (org.mozilla.javascript.Function) ScriptableObject.getProperty(deferred, "resolve");
-                org.mozilla.javascript.Function reject = (org.mozilla.javascript.Function) ScriptableObject.getProperty(deferred, "reject");
+                org.mozilla.javascript.Function resolve =
+                        (org.mozilla.javascript.Function) ScriptableObject.getProperty(deferred, "resolve");
+                org.mozilla.javascript.Function reject =
+                        (org.mozilla.javascript.Function) ScriptableObject.getProperty(deferred, "reject");
+
                 taskExecutor.execute(() -> {
-                    try { JsFetch.JsResponse response = jsFetch.get(url); resolveFetch(resolve, response); }
-                    catch (Exception e) { invokeCallback(reject, new Object[]{"NetworkError: Failed to fetch: " + e.getMessage()}); }
+                    try {
+                        JsFetch.JsResponse response =
+                                jsFetch.request(fMethod, fUrl, fHeaders, fBody);
+                        resolveFetch(resolve, response);
+                    } catch (Exception e) {
+                        Logger.warn(e, "[JS fetch] network error for {}", fUrl);
+                        invokeCallback(reject, new Object[]{
+                                "NetworkError: Failed to fetch: " + e.getMessage()
+                        });
+                    }
                 });
+
                 return ScriptableObject.getProperty(deferred, "promise");
             }
         };
+    }
+
+    /**
+     * Pull headers out of either a plain object { "Name": "value" }
+     * or a Headers-like object that has forEach / entries.
+     */
+    private void extractHeaders(Object headersObj, Map<String, String> out) {
+        if (headersObj == null || headersObj == Undefined.instance) {
+            return;
+        }
+        if (!(headersObj instanceof Scriptable h)) {
+            return;
+        }
+
+        // Plain object: enumerate own keys
+        Object[] ids = ScriptableObject.getPropertyIds(h);
+        if (ids != null) {
+            for (Object id : ids) {
+                String name = Context.toString(id);
+                // Skip functions / internal props
+                if (name.startsWith("_") || name.equals("forEach")
+                        || name.equals("get") || name.equals("set")
+                        || name.equals("has") || name.equals("entries")
+                        || name.equals("keys") || name.equals("values")) {
+                    continue;
+                }
+                Object value = ScriptableObject.getProperty(h, name);
+                if (value != null && value != Undefined.instance
+                        && !(value instanceof Function)) {
+                    out.put(name, Context.toString(value));
+                }
+            }
+        }
     }
 
     private void resolveFetch(
@@ -1394,6 +1870,12 @@ public final class JsBridge {
 
     public static final class JsConsole {
 
+        private final String documentLabel;
+
+        public JsConsole(String documentUrl) {
+            this.documentLabel = safeDocumentLabel(documentUrl);
+        }
+
         public void log(Object... args)   { print("log", args); }
         public void info(Object... args)  { print("info", args); }
         public void warn(Object... args)  { print("warn", args); }
@@ -1403,13 +1885,46 @@ public final class JsBridge {
         public void dir(Object... args)   { print("dir", args); }
 
         private void print(String level, Object... args) {
-            StringBuilder out = new StringBuilder("[JS console.").append(level).append("] ");
+            StringBuilder out = new StringBuilder();
             if (args != null) {
                 for (Object arg : args) {
-                    out.append(arg == null ? "null" : Context.toString(arg)).append(' ');
+                    if (!out.isEmpty()) out.append(' ');
+                    try {
+                        out.append(arg == null ? "null" : Context.toString(arg));
+                    } catch (RuntimeException conversionFailure) {
+                        out.append("[unprintable ")
+                                .append(arg == null ? "null" : arg.getClass().getSimpleName())
+                                .append(']');
+                    }
                 }
             }
-            System.out.println(out.toString().trim());
+            String message = redactSensitiveContent(out.toString());
+            String prefix = "[JS console." + level + "] [{}] {}";
+            switch (level) {
+                case "error" -> Logger.error(prefix, documentLabel, message);
+                case "warn" -> Logger.warn(prefix, documentLabel, message);
+                case "debug", "trace", "dir" -> Logger.debug(prefix, documentLabel, message);
+                default -> Logger.info(prefix, documentLabel, message);
+            }
+        }
+
+        private static String safeDocumentLabel(String documentUrl) {
+            try {
+                URI uri = URI.create(documentUrl);
+                return uri.getScheme() + "://" + uri.getAuthority() + uri.getPath();
+            } catch (RuntimeException e) {
+                return "unknown document";
+            }
+        }
+
+        private static String redactSensitiveContent(String message) {
+            String safe = message.replaceAll("(?i)data:[^\\s\\\"'<>]+", "data:<redacted>");
+            safe = safe.replaceAll("(?i)\\bcookie\\s*[=:]\\s*.*", "cookie=<redacted>");
+            safe = safe.replaceAll("(?i)(https?://[^\\s?]+)\\?[^\\s]+", "$1?<query-redacted>");
+            if (safe.length() > 4096) {
+                safe = safe.substring(0, 4096) + "… [truncated]";
+            }
+            return safe;
         }
     }
 
@@ -1905,40 +2420,7 @@ public final class JsBridge {
     }
 
     private boolean shouldSkipPreprocessing(String scriptUrl) {
-        if (scriptUrl == null || scriptUrl.isBlank()) {
-            return false;
-        }
-
-        try {
-            URI uri = URI.create(scriptUrl);
-
-            String host = uri.getHost();
-            String path = uri.getPath();
-
-            if (host == null || path == null) {
-                return false;
-            }
-
-            host = host.toLowerCase(Locale.ROOT);
-            path = path.toLowerCase(Locale.ROOT);
-
-            // Only skip preprocessing for Google's reCAPTCHA JavaScript.
-            //
-            // Normal Google scripts MUST still go through JsPreprocessor because
-            // Rhino does not understand all of the syntax Google uses.
-            if (host.equals("www.google.com") || host.equals("google.com")) {
-                return path.equals("/recaptcha/enterprise.js");
-            }
-
-            if (host.equals("www.gstatic.com") || host.equals("gstatic.com")) {
-                return path.startsWith("/recaptcha/releases/");
-            }
-
-            return false;
-
-        } catch (Exception ignored) {
-            return false;
-        }
+        return RecaptchaClosureCompat.isRawBundle(scriptUrl);
     }
 
     private void installJsPolyfillsAndHelpers() {
@@ -1949,22 +2431,155 @@ public final class JsBridge {
             cx.setLanguageVersion(Context.VERSION_ES6);
             cx.setOptimizationLevel(-1);
 
-            // 1. Install reCAPTCHA __pbRecaptchaBind helper
+            installXMLHttpRequest(scope);
+
+            // 0. Install reCAPTCHA lQ compatibility fallback.
+            //
+            // Some generated Google Closure/reCAPTCHA code can reference the
+            // minified helper `lQ` before its real implementation is available.
+            // Define it globally so Rhino does not fail with:
+            //
+            //     TypeError: lQ is not a function, it is undefined.
+            //
+            // This is intentionally a no-op fallback for now. If reCAPTCHA gets
+            // further and expects a return value from lQ(), we can implement the
+            // required behaviour based on the next failure.
+            cx.evaluateString(
+                    scope,
+                    """
+                    (function (g) {
+                        if (typeof g.lQ !== 'function') {
+                            g.lQ = function () {
+                                return undefined;
+                            };
+                        }
+                    })(typeof globalThis !== 'undefined' ? globalThis : this);
+                    """,
+                    "recaptcha-lq-compat",
+                    1,
+                    null
+            );
+
+            // 1. DOM host constructors so `x instanceof Element` / `instanceof Node`
+            //    succeed for our Rhino-wrapped JsNode objects.
+            //
+            // reCAPTCHA (and Closure) reject containers that fail this check with:
+            //
+            //     "The bind parameter must be an element or id".
+            cx.evaluateString(
+                    scope,
+                    """
+                    (function (g) {
+                        function isHostNode(x) {
+                            try {
+                                return x != null
+                                    && typeof x.nodeType === 'number'
+                                    && (
+                                        typeof x.getAttribute === 'function'
+                                        || typeof x.appendChild === 'function'
+                                        || typeof x.tagName === 'string'
+                                    );
+                            } catch (e) {
+                                return false;
+                            }
+                        }
+    
+                        function installCtor(name, test) {
+                            if (typeof g[name] === 'function') {
+                                // Still install hasInstance so existing constructors
+                                // accept our Rhino-wrapped host objects.
+                            } else {
+                                g[name] = function () {
+                                    throw new TypeError('Illegal constructor');
+                                };
+                            }
+    
+                            if (typeof Symbol !== 'undefined' && Symbol.hasInstance) {
+                                try {
+                                    Object.defineProperty(
+                                        g[name],
+                                        Symbol.hasInstance,
+                                        {
+                                            configurable: true,
+                                            value: function (instance) {
+                                                return test(instance);
+                                            }
+                                        }
+                                    );
+                                } catch (e) {}
+                            }
+                        }
+    
+                        installCtor('Node', isHostNode);
+    
+                        installCtor('Element', function (x) {
+                            return isHostNode(x) && x.nodeType === 1;
+                        });
+    
+                        installCtor('HTMLElement', function (x) {
+                            return isHostNode(x) && x.nodeType === 1;
+                        });
+    
+                        installCtor('HTMLDivElement', function (x) {
+                            return isHostNode(x)
+                                && x.nodeType === 1
+                                && String(x.tagName || '').toUpperCase() === 'DIV';
+                        });
+    
+                        installCtor('Document', function (x) {
+                            try {
+                                return x != null
+                                    && typeof x.getElementById === 'function'
+                                    && typeof x.createElement === 'function';
+                            } catch (e) {
+                                return false;
+                            }
+                        });
+                    })(typeof globalThis !== 'undefined' ? globalThis : this);
+                    """,
+                    "dom-host-instanceof",
+                    1,
+                    null
+            );
+
+            // 2. Install reCAPTCHA __pbRecaptchaBind helper.
             cx.evaluateString(
                     scope,
                     """
                     if (typeof __pbRecaptchaBind !== 'function') {
                         __pbRecaptchaBind = function (fn, boundThis) {
                             if (typeof fn !== 'function') {
-                                return function() { 
-                                    return (typeof fn === 'function' ? fn : function(){}).apply(boundThis, arguments); 
+                                // .bind(...) was rewritten onto something that is NOT a function.
+                                // Report each distinct case once, with a stack that names the
+                                // bundle line, so the offending call site can be found.
+                                try {
+                                    var d = typeof fn;
+                                    try { d += ' ' + String(fn).slice(0, 100); } catch (e) {}
+                                    var seen = (__pbRecaptchaBind.__seen = __pbRecaptchaBind.__seen || {});
+                                    if (!seen[d] && Object.keys(seen).length < 12) {
+                                        seen[d] = 1;
+                                        console.warn('[BIND-DIAG] .bind() on non-function (' + d + ') at: '
+                                            + String(new Error().stack).split('\\n').slice(0, 6).join(' | '));
+                                    }
+                                } catch (e) {}
+                                return function () {
+                                    return (
+                                        typeof fn === 'function'
+                                            ? fn
+                                            : function () {}
+                                    ).apply(boundThis, arguments);
                                 };
                             }
     
-                            var boundArgs = Array.prototype.slice.call(arguments, 2);
+                            var boundArgs =
+                                Array.prototype.slice.call(arguments, 2);
     
                             return function () {
-                                var callArgs = boundArgs.concat(Array.prototype.slice.call(arguments));
+                                var callArgs =
+                                    boundArgs.concat(
+                                        Array.prototype.slice.call(arguments)
+                                    );
+    
                                 return fn.apply(boundThis, callArgs);
                             };
                         };
@@ -1975,140 +2590,306 @@ public final class JsBridge {
                     null
             );
 
-            // 2. Install TextEncoder & TextDecoder polyfills
-            cx.evaluateString(scope, """
-                if (typeof globalThis === 'undefined') {
-                    var globalThis = this;
-                }
-
-                if (typeof globalThis.TextEncoder === 'undefined') {
-                    globalThis.TextEncoder = function TextEncoder() {};
-                    globalThis.TextEncoder.prototype.encode = function(str) {
-                        str = String(str);
-                        var arr = new Uint8Array(str.length);
-                        for (var i = 0; i < str.length; i++) {
-                            arr[i] = str.charCodeAt(i) & 0xFF;
-                        }
-                        return arr;
-                    };
-                }
-
-                if (typeof globalThis.TextDecoder === 'undefined') {
-                    globalThis.TextDecoder = function TextDecoder() {};
-                    globalThis.TextDecoder.prototype.decode = function(arr) {
-                        if (!arr) return '';
-                        var chimera = [];
-                        for (var i = 0; i < arr.length; i++) {
-                            chimera.push(String.fromCharCode(arr[i]));
-                        }
-                        return chimera.join('');
-                    };
-                }
-                """, "text-encoder-polyfill", 1, null);
-
-            // 3. Install MessageChannel, MessagePort, and global postMessage polyfills
-            cx.evaluateString(scope, """
-                if (typeof globalThis === 'undefined') {
-                    var globalThis = this;
-                }
-
-                if (typeof globalThis.postMessage === 'undefined') {
-                    globalThis.postMessage = function(message, targetOrigin) {
-                        // Global fallback for worker/window cross-messaging
-                        if (typeof globalThis.onmessage === 'function') {
-                            var evt = { data: message, origin: targetOrigin || '*' };
-                            setTimeout(function() {
-                                globalThis.onmessage(evt);
-                            }, 0);
-                        }
-                    };
-                }
-
-                if (typeof globalThis.MessageChannel === 'undefined') {
-                    // MessagePort is an EventTarget: reCAPTCHA/Closure call
-                    // port.addEventListener('message', fn), which used to throw
-                    // "addEventListener and attachEvent are unavailable.".
-                    var MP = function MessagePort() {
-                        this.onmessage = null;
-                        this._listeners = [];
-                        this._peer = null;
-                        this._closed = false;
-                    };
-                    MP.prototype.addEventListener = function(type, listener) {
-                        if (!listener) return;
-                        for (var i = 0; i < this._listeners.length; i++) {
-                            if (this._listeners[i].type === type && this._listeners[i].fn === listener) return;
-                        }
-                        this._listeners.push({ type: String(type), fn: listener });
-                    };
-                    MP.prototype.removeEventListener = function(type, listener) {
-                        for (var i = this._listeners.length - 1; i >= 0; i--) {
-                            if (this._listeners[i].type === type && this._listeners[i].fn === listener) {
-                                this._listeners.splice(i, 1);
+            // 3. Install TextEncoder & TextDecoder polyfills.
+            cx.evaluateString(
+                    scope,
+                    """
+                    if (typeof globalThis === 'undefined') {
+                        var globalThis = this;
+                    }
+    
+                    if (typeof globalThis.TextEncoder === 'undefined') {
+                        globalThis.TextEncoder = function TextEncoder() {};
+    
+                        globalThis.TextEncoder.prototype.encode = function (str) {
+                            str = String(str);
+    
+                            var arr = new Uint8Array(str.length);
+    
+                            for (var i = 0; i < str.length; i++) {
+                                arr[i] = str.charCodeAt(i) & 0xFF;
                             }
-                        }
-                    };
-                    MP.prototype.dispatchEvent = function(evt) {
-                        if (this._closed || !evt) return true;
-                        var type = String(evt.type || 'message');
-                        if (!evt.target) evt.target = this;
-                        if (type === 'message' && typeof this.onmessage === 'function') {
-                            try { this.onmessage(evt); } catch (e) { console.warn('[MessagePort] onmessage failed: ' + e); }
-                        }
-                        var snapshot = this._listeners.slice();
-                        for (var i = 0; i < snapshot.length; i++) {
-                            if (snapshot[i].type !== type) continue;
+    
+                            return arr;
+                        };
+                    }
+    
+                    if (typeof globalThis.TextDecoder === 'undefined') {
+                        globalThis.TextDecoder = function TextDecoder() {};
+    
+                        globalThis.TextDecoder.prototype.decode = function (arr) {
+                            if (!arr) {
+                                return '';
+                            }
+    
+                            var chimera = [];
+    
+                            for (var i = 0; i < arr.length; i++) {
+                                chimera.push(String.fromCharCode(arr[i]));
+                            }
+    
+                            return chimera.join('');
+                        };
+                    }
+                    """,
+                    "text-encoder-polyfill",
+                    1,
+                    null
+            );
+
+            // 4. Install MessageChannel, MessagePort, and global postMessage
+            //    polyfills.
+            cx.evaluateString(
+                    scope,
+                    """
+                    if (typeof globalThis === 'undefined') {
+                        var globalThis = this;
+                    }
+    
+                    if (typeof globalThis.postMessage === 'undefined') {
+                        globalThis.postMessage = function (
+                            message,
+                            targetOrigin
+                        ) {
+                            // Global fallback for worker/window cross-messaging.
+                            if (typeof globalThis.onmessage === 'function') {
+                                var evt = {
+                                    data: message,
+                                    origin: targetOrigin || '*'
+                                };
+    
+                                setTimeout(function () {
+                                    globalThis.onmessage(evt);
+                                }, 0);
+                            }
+                        };
+                    }
+    
+                    if (typeof globalThis.MessageChannel === 'undefined') {
+    
+                        // MessagePort is an EventTarget. reCAPTCHA/Closure call:
+                        //
+                        //     port.addEventListener('message', fn)
+                        //
+                        // which previously threw:
+                        //
+                        //     "addEventListener and attachEvent are unavailable."
+    
+                        var MP = function MessagePort() {
+                            this.onmessage = null;
+                            this._listeners = [];
+                            this._peer = null;
+                            this._closed = false;
+                        };
+    
+                        MP.prototype.addEventListener = function (
+                            type,
+                            listener
+                        ) {
+                            if (!listener) {
+                                return;
+                            }
+    
+                            for (
+                                var i = 0;
+                                i < this._listeners.length;
+                                i++
+                            ) {
+                                if (
+                                    this._listeners[i].type === type
+                                    && this._listeners[i].fn === listener
+                                ) {
+                                    return;
+                                }
+                            }
+    
+                            this._listeners.push({
+                                type: String(type),
+                                fn: listener
+                            });
+                        };
+    
+                        MP.prototype.removeEventListener = function (
+                            type,
+                            listener
+                        ) {
+                            for (
+                                var i = this._listeners.length - 1;
+                                i >= 0;
+                                i--
+                            ) {
+                                if (
+                                    this._listeners[i].type === type
+                                    && this._listeners[i].fn === listener
+                                ) {
+                                    this._listeners.splice(i, 1);
+                                }
+                            }
+                        };
+    
+                        MP.prototype.dispatchEvent = function (evt) {
+                            if (this._closed || !evt) {
+                                return true;
+                            }
+    
+                            var type = String(evt.type || 'message');
+    
+                            if (!evt.target) {
+                                evt.target = this;
+                            }
+    
+                            if (
+                                type === 'message'
+                                && typeof this.onmessage === 'function'
+                            ) {
+                                try {
+                                    this.onmessage(evt);
+                                } catch (e) {
+                                    console.warn(
+                                        '[MessagePort] onmessage failed: ' + e
+                                    );
+                                }
+                            }
+    
+                            var snapshot = this._listeners.slice();
+    
+                            for (
+                                var i = 0;
+                                i < snapshot.length;
+                                i++
+                            ) {
+                                if (snapshot[i].type !== type) {
+                                    continue;
+                                }
+    
+                                try {
+                                    var fn = snapshot[i].fn;
+    
+                                    if (typeof fn === 'function') {
+                                        fn.call(this, evt);
+                                    } else if (
+                                        fn
+                                        && typeof fn.handleEvent === 'function'
+                                    ) {
+                                        fn.handleEvent(evt);
+                                    }
+                                } catch (e) {
+                                    console.warn(
+                                        '[MessagePort] listener failed: ' + e
+                                    );
+                                }
+                            }
+    
+                            return true;
+                        };
+    
+                        MP.prototype.start = function () {};
+    
+                        MP.prototype.close = function () {
+                            this._closed = true;
+                            this._listeners = [];
+                        };
+    
+                        MP.prototype.postMessage = function (message) {
+                            var peer = this._peer;
+    
+                            if (!peer || this._closed) {
+                                return;
+                            }
+    
+                            setTimeout(function () {
+                                peer.dispatchEvent({
+                                    type: 'message',
+                                    data: message,
+                                    ports: [],
+                                    source: null,
+                                    origin: ''
+                                });
+                            }, 0);
+                        };
+    
+                        globalThis.MessagePort = MP;
+    
+                        globalThis.MessageChannel = function MessageChannel() {
+                            this.port1 = new MP();
+                            this.port2 = new MP();
+    
+                            this.port1._peer = this.port2;
+                            this.port2._peer = this.port1;
+                        };
+                    }
+                    """,
+                    "message-channel-polyfill",
+                    1,
+                    null
+            );
+
+            // 5. Closure's goog.events.listen throws when its target has no
+            //    addEventListener/attachEvent/addListener.
+            //
+            // Keep that behaviour but say WHICH object it was, so the missing
+            // event-target can be fixed at the source instead of guessed at.
+            cx.evaluateString(
+                    scope,
+                    """
+                    if (typeof __peakyListenError !== 'function') {
+                        __peakyListenError = function (target) {
+                            var info;
+    
                             try {
-                                var fn = snapshot[i].fn;
-                                if (typeof fn === 'function') fn.call(this, evt);
-                                else if (fn && typeof fn.handleEvent === 'function') fn.handleEvent(evt);
-                            } catch (e) { console.warn('[MessagePort] listener failed: ' + e); }
-                        }
-                        return true;
-                    };
-                    MP.prototype.start = function() {};
-                    MP.prototype.close = function() { this._closed = true; this._listeners = []; };
-                    MP.prototype.postMessage = function(message) {
-                        var peer = this._peer;
-                        if (!peer || this._closed) return;
-                        setTimeout(function() {
-                            peer.dispatchEvent({ type: 'message', data: message, ports: [], source: null, origin: '' });
-                        }, 0);
-                    };
-                    globalThis.MessagePort = MP;
+                                var keys = [];
+    
+                                try {
+                                    for (var k in target) {
+                                        keys.push(k);
+    
+                                        if (keys.length >= 12) {
+                                            break;
+                                        }
+                                    }
+                                } catch (e) {}
+    
+                                info =
+                                    'typeof=' + typeof target
+                                    + ' ctor='
+                                    + (
+                                        target
+                                        && target.constructor
+                                        && target.constructor.name
+                                    )
+                                    + ' str='
+                                    + String(target).slice(0, 80)
+                                    + ' keys=['
+                                    + keys.join(',')
+                                    + ']';
+    
+                            } catch (e) {
+                                info = 'unprintable';
+                            }
+    
+                            try {
+                                console.warn(
+                                    '[LISTEN-DIAG] event target lacks '
+                                    + 'addEventListener/attachEvent/addListener: '
+                                    + info
+                                );
+                            } catch (e) {}
+    
+                            return new Error(
+                                'addEventListener and attachEvent are unavailable.'
+                            );
+                        };
+                    }
+                    """,
+                    "listen-diagnostic",
+                    1,
+                    null
+            );
 
-                    globalThis.MessageChannel = function MessageChannel() {
-                        this.port1 = new MP();
-                        this.port2 = new MP();
-                        this.port1._peer = this.port2;
-                        this.port2._peer = this.port1;
-                    };
-                }
-                """, "message-channel-polyfill", 1, null);
+            Logger.info(
+                    "[JS-COMPAT] Successfully installed JS polyfills and reCAPTCHA helpers."
+            );
 
-            // 4. Closure's goog.events.listen throws when its target has no
-            // addEventListener/attachEvent/addListener. Keep that behaviour but
-            // say WHICH object it was, so the missing event-target can be fixed
-            // at the source instead of guessed at.
-            cx.evaluateString(scope, """
-                if (typeof __peakyListenError !== 'function') {
-                    __peakyListenError = function (target) {
-                        var info;
-                        try {
-                            var keys = [];
-                            try { for (var k in target) { keys.push(k); if (keys.length >= 12) break; } } catch (e) {}
-                            info = 'typeof=' + typeof target
-                                + ' ctor=' + (target && target.constructor && target.constructor.name)
-                                + ' str=' + String(target).slice(0, 80)
-                                + ' keys=[' + keys.join(',') + ']';
-                        } catch (e) { info = 'unprintable'; }
-                        try { console.warn('[LISTEN-DIAG] event target lacks addEventListener/attachEvent/addListener: ' + info); } catch (e) {}
-                        return new Error('addEventListener and attachEvent are unavailable.');
-                    };
-                }
-                """, "listen-diagnostic", 1, null);
-
-            Logger.info("[JS-COMPAT] Successfully installed JS polyfills and reCAPTCHA helpers.");
         } catch (Throwable e) {
             Logger.warn(
                     e,
@@ -2119,69 +2900,6 @@ public final class JsBridge {
                 Context.exit();
             }
         }
-    }
-
-    private static final Pattern LISTEN_THROW = Pattern.compile(
-            "else\\s+if\\s*\\(\\s*([\\w$]+)\\.addListener\\s*&&\\s*\\1\\.removeListener\\s*\\)"
-                    + "\\s*\\1\\.addListener\\(([\\w$]+)\\)\\s*;"
-                    + "\\s*else\\s+throw\\s+Error\\(\\s*\"addEventListener and attachEvent are unavailable\\.\"\\s*\\)"
-    );
-
-    private String applyRecaptchaCompatibility(String script) {
-        if (script == null || script.isBlank()) {
-            return script;
-        }
-
-        // Match any expression preceding .bind( up to the start of the statement/expression token
-        Pattern pattern = Pattern.compile(
-                "([A-Za-z_$][\\w$]*(?:\\s*\\[[^\\]]+\\]|\\s*\\([^\\)]*\\)|\\s*\\.[\\w$]+)*)\\.bind\\("
-        );
-
-        Matcher matcher = pattern.matcher(script);
-
-        StringBuffer output = new StringBuffer();
-        int replacements = 0;
-
-        while (matcher.find()) {
-            String targetExpr = matcher.group(1);
-
-            if (targetExpr.contains("__pbRecaptchaBind")) {
-                continue;
-            }
-
-            String replacement = "__pbRecaptchaBind(" + targetExpr + ", ";
-
-            matcher.appendReplacement(
-                    output,
-                    Matcher.quoteReplacement(replacement)
-            );
-
-            replacements++;
-        }
-
-        matcher.appendTail(output);
-
-        // Not a syntax change: same control flow, but the throw now names the offending
-        // event target (see __peakyListenError) instead of failing anonymously.
-        String rewritten = LISTEN_THROW.matcher(output.toString()).replaceAll(
-                "else if($1.addListener&&$1.removeListener)$1.addListener($2);else throw __peakyListenError($1)"
-        );
-        int listenRewrites = rewritten.equals(output.toString()) ? 0 : 1;
-
-        if (replacements > 0) {
-            Logger.info(
-                    "[JS-COMPAT] Rewrote {} reCAPTCHA .bind() call(s)",
-                    replacements
-            );
-        }
-        if (listenRewrites > 0) {
-            Logger.info("[JS-COMPAT] Instrumented reCAPTCHA listen() failure path");
-        }
-        if (replacements > 0 || listenRewrites > 0) {
-            installJsPolyfillsAndHelpers();
-        }
-
-        return rewritten;
     }
 
     public void setOnNavigate(java.util.function.Consumer<String> listener) {
@@ -2203,9 +2921,313 @@ public final class JsBridge {
             future.cancel(false);
         }
         scheduledTasks.clear();
+        executedSources.clear();
         taskExecutor.shutdownNow();
         scriptLoader.shutdownNow();
         Logger.info("[JS] Closed JavaScript environment for {}", documentUrlOrEmpty());
+    }
+
+    private void installXMLHttpRequest(ScriptableObject scope) {
+        BaseFunction xhrConstructor = new BaseFunction() {
+
+            @Override
+            public Object call(
+                    Context cx,
+                    Scriptable scope,
+                    Scriptable thisObj,
+                    Object[] args
+            ) {
+                return construct(cx, scope, args);
+            }
+
+            @Override
+            public Scriptable construct(
+                    Context cx,
+                    Scriptable scope,
+                    Object[] args
+            ) {
+                JsXMLHttpRequest xhr =
+                        new JsXMLHttpRequest(http, getDocumentUrl());
+
+                XHRScriptable wrapper = new XHRScriptable(xhr);
+
+                wrapper.setParentScope(scope);
+                wrapper.setPrototype(
+                        ScriptableObject.getObjectPrototype(scope)
+                );
+
+                return wrapper;
+            }
+        };
+
+        /*
+         * Do NOT call:
+         *
+         * xhrConstructor.setFunctionName("XMLHttpRequest");
+         *
+         * Your Rhino version does not expose setFunctionName().
+         */
+
+        ScriptableObject.putProperty(
+                scope,
+                "XMLHttpRequest",
+                xhrConstructor
+        );
+
+        Logger.info("[JS] Installed XMLHttpRequest");
+    }
+
+    private void installXMLHttpRequest(Scriptable scope) {
+        BaseFunction xhrConstructor = new BaseFunction() {
+
+            @Override
+            public Object call(
+                    Context cx,
+                    Scriptable scope,
+                    Scriptable thisObj,
+                    Object[] args
+            ) {
+                return construct(cx, scope, args);
+            }
+
+            @Override
+            public Scriptable construct(
+                    Context cx,
+                    Scriptable scope,
+                    Object[] args
+            ) {
+                JsXMLHttpRequest xhr =
+                        new JsXMLHttpRequest(http, getDocumentUrl());
+
+                XHRScriptable wrapper = new XHRScriptable(xhr);
+
+                wrapper.setParentScope(scope);
+                wrapper.setPrototype(
+                        ScriptableObject.getObjectPrototype(scope)
+                );
+
+                return wrapper;
+            }
+        };
+
+        ScriptableObject.putProperty(
+                scope,
+                "XMLHttpRequest",
+                xhrConstructor
+        );
+
+        Logger.info("[JS] Installed XMLHttpRequest");
+    }
+
+    private static final class XHRScriptable extends ScriptableObject {
+
+        private final JsXMLHttpRequest xhr;
+
+        XHRScriptable(JsXMLHttpRequest xhr) {
+            this.xhr = xhr;
+
+            put(
+                    "open",
+                    this,
+                    function((cx, scope, thisObj, args) -> {
+
+                        String method =
+                                args.length > 0
+                                        ? Context.toString(args[0])
+                                        : "GET";
+
+                        String url =
+                                args.length > 1
+                                        ? Context.toString(args[1])
+                                        : "";
+
+                        boolean async =
+                                args.length > 2
+                                        ? Context.toBoolean(args[2])
+                                        : true;
+
+                        xhr.open(method, url, async);
+
+                        return Undefined.instance;
+                    })
+            );
+
+            put(
+                    "setRequestHeader",
+                    this,
+                    function((cx, scope, thisObj, args) -> {
+
+                        if (args.length < 2) {
+                            throw Context.reportRuntimeError(
+                                    "XMLHttpRequest.setRequestHeader requires 2 arguments"
+                            );
+                        }
+
+                        xhr.setRequestHeader(
+                                Context.toString(args[0]),
+                                Context.toString(args[1])
+                        );
+
+                        return Undefined.instance;
+                    })
+            );
+
+            put(
+                    "send",
+                    this,
+                    function((cx, scope, thisObj, args) -> {
+
+                        try {
+                            if (args.length == 0
+                                    || args[0] == Undefined.instance
+                                    || args[0] == null) {
+
+                                xhr.send();
+
+                            } else {
+
+                                xhr.send(
+                                        Context.toString(args[0])
+                                );
+                            }
+
+                            return Undefined.instance;
+
+                        } catch (Throwable e) {
+                            throw Context.throwAsScriptRuntimeEx(e);
+                        }
+                    })
+            );
+
+            put(
+                    "abort",
+                    this,
+                    function((cx, scope, thisObj, args) -> {
+
+                        xhr.abort();
+
+                        return Undefined.instance;
+                    })
+            );
+
+            put(
+                    "getResponseHeader",
+                    this,
+                    function((cx, scope, thisObj, args) -> {
+
+                        if (args.length == 0) {
+                            return null;
+                        }
+
+                        return xhr.getResponseHeader(
+                                Context.toString(args[0])
+                        );
+                    })
+            );
+
+            put(
+                    "getAllResponseHeaders",
+                    this,
+                    function((cx, scope, thisObj, args) -> {
+
+                        return xhr.getAllResponseHeaders();
+                    })
+            );
+        }
+
+        @Override
+        public String getClassName() {
+            return "XMLHttpRequest";
+        }
+
+        @Override
+        public Object get(
+                String name,
+                Scriptable start
+        ) {
+            return switch (name) {
+
+                case "readyState" ->
+                        xhr.getReadyState();
+
+                case "status" ->
+                        xhr.getStatus();
+
+                case "statusText" ->
+                        xhr.getStatusText();
+
+                case "responseText" ->
+                        xhr.getResponseText();
+
+                case "responseURL" ->
+                        xhr.getResponseURL();
+
+                case "withCredentials" ->
+                        xhr.getWithCredentials();
+
+                case "timeout" ->
+                        xhr.getTimeout();
+
+                default ->
+                        super.get(name, start);
+            };
+        }
+
+        @Override
+        public void put(
+                String name,
+                Scriptable start,
+                Object value
+        ) {
+            switch (name) {
+
+                case "withCredentials" ->
+                        xhr.setWithCredentials(
+                                Context.toBoolean(value)
+                        );
+
+                case "timeout" ->
+                        xhr.setTimeout(
+                                (int) Context.toNumber(value)
+                        );
+
+                default ->
+                        super.put(name, start, value);
+            }
+        }
+
+        private static BaseFunction function(
+                RhinoFunction implementation
+        ) {
+            return new BaseFunction() {
+
+                @Override
+                public Object call(
+                        Context cx,
+                        Scriptable scope,
+                        Scriptable thisObj,
+                        Object[] args
+                ) {
+                    return implementation.call(
+                            cx,
+                            scope,
+                            thisObj,
+                            args
+                    );
+                }
+            };
+        }
+
+        @FunctionalInterface
+        private interface RhinoFunction {
+
+            Object call(
+                    Context cx,
+                    Scriptable scope,
+                    Scriptable thisObj,
+                    Object[] args
+            );
+        }
     }
 
     private String documentUrlOrEmpty() {

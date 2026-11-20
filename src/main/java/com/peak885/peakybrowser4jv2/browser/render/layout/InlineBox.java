@@ -25,7 +25,7 @@ public final class InlineBox extends Box {
     public final boolean forcedBreak;
 
     @Nullable
-    private final ImageData image;
+    private final ImageContext imageContext;
 
     @Nullable
     private final Box blockContent;
@@ -52,7 +52,7 @@ public final class InlineBox extends Box {
         this.href = href;
         this.spaceBefore = spaceBefore;
         this.forcedBreak = false;
-        this.image = null;
+        this.imageContext = null;
         this.blockContent = null;
     }
 
@@ -63,13 +63,13 @@ public final class InlineBox extends Box {
         this.href = null;
         this.spaceBefore = false;
         this.forcedBreak = forcedBreak;
-        this.image = null;
+        this.imageContext = null;
         this.blockContent = null;
     }
 
     private InlineBox(
             @NotNull ComputedStyle style,
-            @NotNull ImageData image,
+            @NotNull ImageContext imageContext,
             @Nullable String href
     ) {
         super(style);
@@ -78,7 +78,7 @@ public final class InlineBox extends Box {
         this.href = href;
         this.spaceBefore = false;
         this.forcedBreak = false;
-        this.image = image;
+        this.imageContext = imageContext;
         this.blockContent = null;
     }
 
@@ -93,7 +93,7 @@ public final class InlineBox extends Box {
         this.href = href;
         this.spaceBefore = false;
         this.forcedBreak = false;
-        this.image = null;
+        this.imageContext = null;
         this.blockContent = blockContent;
     }
 
@@ -105,10 +105,10 @@ public final class InlineBox extends Box {
     @NotNull
     public static InlineBox image(
             @NotNull ComputedStyle style,
-            @NotNull ImageData image,
+            @NotNull ImageContext imageContext,
             @Nullable String href
     ) {
-        return new InlineBox(style, image, href);
+        return new InlineBox(style, imageContext, href);
     }
 
     @NotNull
@@ -121,7 +121,7 @@ public final class InlineBox extends Box {
     }
 
     public boolean isImage() {
-        return image != null;
+        return imageContext != null;
     }
 
     public boolean isInlineBlock() {
@@ -130,7 +130,11 @@ public final class InlineBox extends Box {
 
     @Nullable
     public ImageData image() {
-        return image;
+        return imageContext == null ? null : imageContext.image();
+    }
+
+    ImageContext imageContext() {
+        return imageContext;
     }
 
     @Nullable
@@ -249,6 +253,7 @@ public final class InlineBox extends Box {
     }
 
     private void paintImage(@NotNull Graphics2D g) {
+        ImageData image = image();
         if (image == null) {
             return;
         }

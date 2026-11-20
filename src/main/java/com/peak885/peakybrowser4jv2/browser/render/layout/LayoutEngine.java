@@ -2,6 +2,7 @@ package com.peak885.peakybrowser4jv2.browser.render.layout;
 
 import com.peak885.peakybrowser4jv2.browser.BrowserLoader;
 import com.peak885.peakybrowser4jv2.browser.image.ImageData;
+import com.peak885.peakybrowser4jv2.browser.js.CanvasRenderingContext2D;
 import com.peak885.peakybrowser4jv2.browser.render.style.ComputedStyle;
 import com.peak885.peakybrowser4jv2.browser.render.style.StyleResolver;
 
@@ -19,6 +20,7 @@ public final class LayoutEngine {
 
     private final StyleResolver styleResolver;
     private final BrowserLoader browserLoader;
+    private Runnable pipelineInvalidator = () -> {};
 
     public LayoutEngine(
             StyleResolver styleResolver,
@@ -26,6 +28,10 @@ public final class LayoutEngine {
     ) {
         this.styleResolver = styleResolver;
         this.browserLoader = browserLoader;
+    }
+
+    public void setPipelineInvalidator(Runnable invalidator) {
+        this.pipelineInvalidator = invalidator == null ? () -> {} : invalidator;
     }
 
     public Box build(
@@ -52,10 +58,12 @@ public final class LayoutEngine {
         ComputedStyle htmlStyle =
                 styleResolver.resolve(html, null);
 
+        // Pass browserLoader here!
         BlockBox root =
                 new BlockBox(
                         htmlStyle,
-                        null
+                        null,
+                        browserLoader
                 );
 
         root.sourceElement = html;
@@ -77,7 +85,7 @@ public final class LayoutEngine {
                 htmlStyle
         );
 
-        root.layout( //<--sussy
+        root.layout(
                 viewportWidth,
                 0,
                 0
@@ -106,7 +114,8 @@ public final class LayoutEngine {
         if (box.sourceElement != null) {
             ComputedStyle resolved =
                     styleResolver.resolve(box.sourceElement, parentStyle);
-            box.replaceStyle(resolved);
+            // Animated so transition: on :hover / :active actually runs.
+            box.replaceStyleAnimated(resolved);
             styleForChildren = resolved;
         } else if (box.style != null) {
             styleForChildren = box.style;
@@ -248,6 +257,71 @@ public final class LayoutEngine {
 
             /*
              * ---------------------------------------------------------
+             * CANVAS
+             * ---------------------------------------------------------
+             */
+            if ("canvas".equals(tag)) {
+                float w = parseDimension(element.attr("width"), 300f);
+                float h = parseDimension(element.attr("height"), 150f);
+                style.set("width", w + "px");
+                style.set("height", h + "px");
+
+                ElementBox canvasBox = new ElementBox(style, element, null,
+                        CanvasRenderingContext2D.forElement(element, null));
+                canvasBox.sourceElement = element;
+                if (style.isAbsolutelyPositioned()) {
+                    flush(collector, parentBox, parentStyle);
+                    parentBox.children.add(canvasBox);
+                } else if (style.isBlock()) {
+                    flush(collector, parentBox, parentStyle);
+                    parentBox.children.add(canvasBox);
+                } else {
+                    collector.buffer.add(InlineBox.inlineBlock(style, canvasBox, href));
+                    collector.pendingSpace = false;
+                }
+                continue;
+            }
+
+            /*
+             * ---------------------------------------------------------
+             * IFRAME (Real Sub-Context Provisioning Engine)
+             * ---------------------------------------------------------
+             */
+            if ("iframe".equals(tag)) {
+                float w = parseDimension(element.attr("width"), 300f);
+                float h = parseDimension(element.attr("height"), 150f);
+
+                style.set("width", w + "px");
+                style.set("height", h + "px");
+
+                IframeBox iframeBox =
+                        new IframeBox(
+                                style,
+                                element,
+                                browserLoader,
+                                this::invalidatePipeline
+                        );
+
+                if (style.isAbsolutelyPositioned() || style.isBlock()) {
+                    flush(collector, parentBox, parentStyle);
+                    parentBox.children.add(iframeBox);
+                } else {
+                    collector.buffer.add(
+                            InlineBox.inlineBlock(
+                                    style,
+                                    iframeBox,
+                                    href
+                            )
+                    );
+
+                    collector.pendingSpace = false;
+                }
+
+                continue;
+            }
+
+            /*
+             * ---------------------------------------------------------
              * ABSOLUTE / FIXED
              * ---------------------------------------------------------
              */
@@ -259,10 +333,12 @@ public final class LayoutEngine {
                         parentStyle
                 );
 
+                // Pass browserLoader here!
                 BlockBox positioned =
                         new BlockBox(
                                 style,
-                                null
+                                null,
+                                browserLoader
                         );
 
                 positioned.sourceElement =
@@ -307,7 +383,6 @@ public final class LayoutEngine {
                 ElementBox elementBox = new ElementBox(style, element, captchaImage);
                 elementBox.sourceElement = element;
 
-                // Treat form elements as inline-blocks so they flow horizontally!
                 collector.buffer.add(
                         InlineBox.inlineBlock(
                                 style,
@@ -327,10 +402,12 @@ public final class LayoutEngine {
              */
             if (style.isInlineBlock()) {
 
+                // Pass browserLoader here!
                 BlockBox content =
                         new BlockBox(
                                 style,
-                                null
+                                null,
+                                browserLoader
                         );
 
                 content.sourceElement =
@@ -386,10 +463,12 @@ public final class LayoutEngine {
                                 ? listMarker(element)
                                 : null;
 
+                // Pass browserLoader here!
                 BlockBox block =
                         new BlockBox(
                                 style,
-                                marker
+                                marker,
+                                browserLoader
                         );
 
                 block.sourceElement =
@@ -455,47 +534,21 @@ public final class LayoutEngine {
 
         String imageUrl = resolveImageUrl(element, src);
 
-        try {
-
-            ImageData image =
-                    browserLoader.loadImage(
-                            imageUrl
-                    );
-
-            applyImageDimensions(element, style);
-
-            collector.buffer.add(
-                    InlineBox.image(
-                            style,
-                            image,
-                            href
-                    )
-            );
-
-            collector.pendingSpace = false;
-
-            Logger.debug(
-                    "IMG {}x{} ({})",
-                    image.intrinsicWidth(),
-                    image.intrinsicHeight(),
-                    imageUrl
-            );
-
-        } catch (IOException e) {
-
-            Logger.warn(
-                    e,
-                    "Failed to load image: {}",
-                    imageUrl
-            );
-
+        applyImageDimensions(element, style);
+        ImageContext image = ImageContext.forElement(element, browserLoader);
+        if (image.failed()) {
             renderAltText(
                     element,
                     style,
                     href,
                     collector
             );
+            return;
         }
+
+        image.load(imageUrl, this::invalidatePipeline);
+        collector.buffer.add(InlineBox.image(style, image, href));
+        collector.pendingSpace = false;
     }
 
     private ImageData loadCaptchaImage(
@@ -514,14 +567,6 @@ public final class LayoutEngine {
         try {
             ImageData image = browserLoader.loadImage(imageUrl);
             applyImageDimensions(element, style);
-
-            Logger.debug(
-                    "CAPTCHA {}x{} ({})",
-                    image.intrinsicWidth(),
-                    image.intrinsicHeight(),
-                    imageUrl
-            );
-
             return image;
         } catch (IOException e) {
             Logger.warn(e, "Failed to load CAPTCHA image: {}", imageUrl);
@@ -593,9 +638,13 @@ public final class LayoutEngine {
             return;
         }
 
-        /*
-         * HTML collapses ordinary whitespace.
-         */
+        // Honor CSS white-space so <pre> and similar keep their formatting.
+        if (style.preservesNewlines() || style.preservesSpaces()) {
+            collectPreformattedText(raw, style, href, collector);
+            return;
+        }
+
+        // white-space: normal / nowrap — collapse runs of whitespace to a single space
         String collapsed =
                 raw.replaceAll(
                         "[\\t\\n\\r ]+",
@@ -611,10 +660,6 @@ public final class LayoutEngine {
         String trimmed =
                 collapsed.trim();
 
-        /*
-         * Whitespace-only text nodes can still
-         * represent a space between inline nodes.
-         */
         if (trimmed.isEmpty()) {
 
             if (!collector.buffer.isEmpty()) {
@@ -656,6 +701,118 @@ public final class LayoutEngine {
                 trailingSpace;
     }
 
+    /**
+     * Handles white-space: pre / pre-wrap / pre-line.
+     * Newlines become forced line breaks; spaces and tabs are preserved
+     * (tabs expanded to 4 spaces for measurement).
+     */
+    private void collectPreformattedText(
+            String raw,
+            ComputedStyle style,
+            String href,
+            InlineCollector collector
+    ) {
+        // Normalize only \r\n / \r → \n so we have a single line terminator.
+        String normalized = raw.replace("\r\n", "\n").replace('\r', '\n');
+
+        // Expand tabs early so FontMetrics sees ordinary spaces.
+        normalized = expandTabs(normalized, 4);
+
+        boolean preserveSpaces = style.preservesSpaces(); // pre / pre-wrap
+        // pre-line collapses spaces but still keeps newlines
+
+        int start = 0;
+        int length = normalized.length();
+
+        for (int i = 0; i <= length; i++) {
+            boolean atEnd = i == length;
+            boolean atNewline = !atEnd && normalized.charAt(i) == '\n';
+
+            if (!atEnd && !atNewline) {
+                continue;
+            }
+
+            // Segment from start .. i (exclusive)
+            if (i > start) {
+                String segment = normalized.substring(start, i);
+
+                if (preserveSpaces) {
+                    // Keep the exact characters (including multiple spaces)
+                    // as a single token so consecutive spaces are not collapsed.
+                    collector.buffer.add(
+                            new InlineBox(style, segment, href, false)
+                    );
+                } else {
+                    // pre-line: collapse internal whitespace runs to single spaces,
+                    // but do not trim the whole segment (leading/trailing on a
+                    // line can still matter for alignment in some cases; we
+                    // still collapse for visual closeness to CSS).
+                    String collapsed = segment.replaceAll("[ \\t]+", " ");
+                    if (!collapsed.isEmpty()) {
+                        // Split on spaces so soft-wrap (if allowed) can break
+                        // between words; spaceBefore carries the space width.
+                        String[] words = collapsed.split(" ", -1);
+                        for (int w = 0; w < words.length; w++) {
+                            if (words[w].isEmpty() && w == words.length - 1) {
+                                // trailing space from the split
+                                collector.pendingSpace = true;
+                                continue;
+                            }
+                            boolean spaceBefore = w > 0
+                                    || (w == 0 && collector.pendingSpace);
+                            if (!words[w].isEmpty()) {
+                                collector.buffer.add(
+                                        new InlineBox(
+                                                style,
+                                                words[w],
+                                                href,
+                                                spaceBefore
+                                        )
+                                );
+                                collector.pendingSpace = false;
+                            } else if (w > 0) {
+                                // consecutive spaces already collapsed
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (atNewline) {
+                collector.buffer.add(InlineBox.lineBreak(style));
+                collector.pendingSpace = false;
+            }
+
+            start = i + 1;
+        }
+    }
+
+    private static String expandTabs(String text, int tabSize) {
+        if (text.indexOf('\t') < 0) {
+            return text;
+        }
+        StringBuilder sb = new StringBuilder(text.length() + 8);
+        int col = 0;
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (c == '\t') {
+                int spaces = tabSize - (col % tabSize);
+                for (int s = 0; s < spaces; s++) {
+                    sb.append(' ');
+                }
+                col += spaces;
+            } else {
+                sb.append(c);
+                if (c == '\n') {
+                    col = 0;
+                } else {
+                    col++;
+                }
+            }
+        }
+        return sb.toString();
+    }
+
     private void flush(
             InlineCollector collector,
             Box parentBox,
@@ -665,9 +822,6 @@ public final class LayoutEngine {
             return;
         }
 
-        // Use the containing block's style so text-align (and other
-        // inherited properties) reach closeLine(). An empty style was
-        // forcing every line to left-align.
         ComputedStyle styleForFlow =
                 flowStyle != null
                         ? flowStyle
@@ -711,18 +865,9 @@ public final class LayoutEngine {
 
     private boolean isNonRenderedElement(String tag) {
         return switch (tag) {
-            case "head",
-                 "meta",
-                 "title",
-                 "link",
-                 "style",
-                 "script",
-                 "template",
-                 "noscript",
-                 "iframe",
-                 "object",
-                 "embed" -> true;
-
+            case "head", "meta", "title", "link", "style",
+                 "script", "template", "noscript",
+                 "object", "embed" -> true;
             default -> false;
         };
     }
@@ -794,5 +939,37 @@ public final class LayoutEngine {
         );
 
         collector.pendingSpace = false;
+    }
+
+    private float parseDimension(String value, float defaultValue) {
+        if (value == null || value.isBlank()) {
+            return defaultValue;
+        }
+
+        value = value.trim();
+
+        try {
+            if (value.matches("\\d+(\\.\\d+)?")) {
+                return Float.parseFloat(value);
+            }
+
+            if (value.toLowerCase().endsWith("px")) {
+                return Float.parseFloat(
+                        value.substring(0, value.length() - 2).trim()
+                );
+            }
+
+            if (value.endsWith("%")) {
+                return defaultValue;
+            }
+
+        } catch (NumberFormatException ignored) {
+        }
+
+        return defaultValue;
+    }
+
+    private void invalidatePipeline() {
+        javax.swing.SwingUtilities.invokeLater(pipelineInvalidator);
     }
 }

@@ -7,6 +7,8 @@ import org.jsoup.parser.Tag;
 import org.jsoup.select.Elements;
 import org.mozilla.javascript.Context;
 import org.mozilla.javascript.NativeArray;
+import org.mozilla.javascript.Scriptable;
+import org.mozilla.javascript.ScriptableObject;
 
 import java.util.IdentityHashMap;
 import java.util.Map;
@@ -37,6 +39,7 @@ public final class JsNode implements ExpandoHost {
     private final Element element;
     private final Ctx ctx;
     private final JsEventTarget events;
+    private CanvasRenderingContext2D canvas;
 
     JsNode(Element element, Ctx ctx) {
         this.element = element;
@@ -46,6 +49,34 @@ public final class JsNode implements ExpandoHost {
 
     private void invalidate() {
         ctx.invalidate();
+    }
+
+    public synchronized CanvasRenderingContext2D getContext(String type) {
+        if (!"canvas".equalsIgnoreCase(element.tagName()) || !"2d".equalsIgnoreCase(type)) return null;
+        if (canvas == null) canvas = CanvasRenderingContext2D.forElement(element, this::invalidate);
+        return canvas;
+    }
+
+    public int getWidth() {
+        if (!"canvas".equalsIgnoreCase(element.tagName())) return 0;
+        return getContext("2d").getWidth();
+    }
+
+    public void setWidth(int width) {
+        if ("canvas".equalsIgnoreCase(element.tagName())) getContext("2d").setWidth(width);
+        element.attr("width", Integer.toString(Math.max(0, width)));
+        invalidate();
+    }
+
+    public int getHeight() {
+        if (!"canvas".equalsIgnoreCase(element.tagName())) return 0;
+        return getContext("2d").getHeight();
+    }
+
+    public void setHeight(int height) {
+        if ("canvas".equalsIgnoreCase(element.tagName())) getContext("2d").setHeight(height);
+        element.attr("height", Integer.toString(Math.max(0, height)));
+        invalidate();
     }
 
     // ============================================================
@@ -89,13 +120,6 @@ public final class JsNode implements ExpandoHost {
             return "#text";
         }
         return element.tagName();
-    }
-
-    public short getNodeType() {
-        if (isFakeTextNode()) {
-            return 3; // TEXT_NODE
-        }
-        return 1; // ELEMENT_NODE
     }
 
     // ============================================================
@@ -178,6 +202,7 @@ public final class JsNode implements ExpandoHost {
     }
 
     public void setInnerHTML(String html) {
+        logDataImageMutation("innerHTML", html);
         element.html(html == null ? "" : html);
         invalidate();
     }
@@ -332,6 +357,7 @@ public final class JsNode implements ExpandoHost {
     }
 
     public void setSrc(String src) {
+        logDataImageMutation("src", src);
         setOrRemoveAttribute("src", src);
     }
 
@@ -394,12 +420,14 @@ public final class JsNode implements ExpandoHost {
 
     public String getAttribute(String name) {
         if (name == null || name.isBlank()) {
-            return "";
+            return null;
         }
 
+        // Browsers return null (not "") when the attribute is absent.
+        // reCAPTCHA and many scripts rely on the null/empty distinction.
         return element.hasAttr(name)
                 ? element.attr(name)
-                : "";
+                : null;
     }
 
     public JsDataset getDataset() {
@@ -432,12 +460,24 @@ public final class JsNode implements ExpandoHost {
     }
 
     public void setAttribute(String name, String value) {
+        if ("src".equalsIgnoreCase(name) || "style".equalsIgnoreCase(name)) {
+            logDataImageMutation(name, value);
+        }
         if (name == null || name.isBlank()) {
             return;
         }
 
         element.attr(name, value == null ? "" : value);
         invalidate();
+    }
+
+    private void logDataImageMutation(String property, String value) {
+        if (value == null || !value.toLowerCase(java.util.Locale.ROOT).contains("data:image/")) return;
+        boolean malformedMarker = value.contains("iVBORw0KGgBX");
+        String classes = element.className();
+        org.tinylog.Logger.info(
+                "[IMAGE-DOM] {} set on <{} id={} class={}> containing data image URI(s); malformed-PNG-marker={}",
+                property, element.tagName(), element.id(), classes, malformedMarker);
     }
 
     public void removeAttribute(String name) {
@@ -543,8 +583,8 @@ public final class JsNode implements ExpandoHost {
                 : ctx.wrap(previous);
     }
 
-    public JsNode[] getChildren() {
-        return wrapAll(element.children());
+    public Object getChildren() {
+        return ctx.toJsNodeArray(wrapAll(element.children()));
     }
 
     public int getChildElementCount() {
@@ -575,7 +615,53 @@ public final class JsNode implements ExpandoHost {
     }
 
     /** node.insertBefore(newNode, referenceNode) - a null reference appends. */
-    public JsNode insertBefore(JsNode newNode, JsNode referenceNode) {
+    /**
+     * Fallback overloads for calls where a script passes something that is not one of our
+     * nodes (Rhino then reports "Can't find method JsNode.insertBefore(function,null)" and
+     * aborts the whole script). Log what was passed - the function's source usually shows
+     * which Closure object the page code mistook for an element - and carry on, as a browser
+     * would with a thrown-and-caught TypeError.
+     */
+    public JsNode insertBefore(Object newNode, Object referenceNode) {
+        if (newNode instanceof JsNode n && (referenceNode == null || referenceNode instanceof JsNode)) {
+            return insertBefore(n, (JsNode) referenceNode);
+        }
+        logBadNodeArgument("insertBefore", newNode);
+        return null;
+    }
+
+    public JsNode appendChild(Object child) {
+        if (child instanceof JsNode n) {
+            return appendChild(n);
+        }
+        logBadNodeArgument("appendChild", child);
+        return null;
+    }
+
+    private void logBadNodeArgument(String method, Object argument) {
+        String description;
+        if (argument == null) {
+            description = "null";
+        } else if (argument instanceof org.mozilla.javascript.Function fn) {
+            String source;
+            try {
+                source = org.mozilla.javascript.Context.toString(fn);
+            } catch (RuntimeException e) {
+                source = "(unprintable)";
+            }
+            if (source.length() > 500) {
+                source = source.substring(0, 500) + "...(cut)";
+            }
+            String name = fn instanceof org.mozilla.javascript.BaseFunction bf ? bf.getFunctionName() : "";
+            description = "JS function '" + name + "': " + source;
+        } else {
+            description = argument.getClass().getName() + ": " + argument;
+        }
+        org.tinylog.Logger.warn("[DOM] <{}>.{}() was given a non-node argument; ignoring. Argument = {}",
+                element.tagName(), method, description);
+    }
+
+    private JsNode insertBefore(JsNode newNode, JsNode referenceNode) {
         if (newNode == null) {
             return null;
         }
@@ -602,16 +688,11 @@ public final class JsNode implements ExpandoHost {
         return newNode;
     }
 
-    public JsNode appendChild(JsNode child) {
+    private JsNode appendChild(JsNode child) {
         if (child == null) {
             return null;
         }
 
-        // Expand fake text nodes from document.createTextNode into real
-        // content. Google and many others inject CSS with:
-        //   styleEl.appendChild(document.createTextNode(css))
-        // For <style>/<script> that content must be a DataNode so
-        // StyleResolver.collectAuthorCss (style.data()) sees it.
         if (child.isFakeTextNode()) {
             String text = child.element.attr(TEXT_NODE_ATTR);
             String tag = element.tagName();
@@ -713,23 +794,16 @@ public final class JsNode implements ExpandoHost {
 
     public Object querySelectorAll(String selector) {
         if (selector == null || selector.isBlank()) {
-            return new NativeArray(0);
+            return ctx.toJsNodeArray(new JsNode[0]);
         }
 
         Elements elements = element.select(selector);
-
-        Object[] nodes = new Object[elements.size()];
-
-        for (int i = 0; i < elements.size(); i++) {
-            nodes[i] = ctx.wrap(elements.get(i));
-        }
-
-        return new NativeArray(nodes);
+        return ctx.toJsNodeArray(wrapAll(elements));
     }
 
-    public JsNode[] getElementsByTagName(String tagName) {
+    public Object getElementsByTagName(String tagName) {
         if (tagName == null || tagName.isBlank()) {
-            return new JsNode[0];
+            return ctx.toJsNodeArray(new JsNode[0]);
         }
 
         Elements elements;
@@ -740,17 +814,17 @@ public final class JsNode implements ExpandoHost {
             elements = element.getElementsByTag(tagName);
         }
 
-        return wrapAll(elements);
+        return ctx.toJsNodeArray(wrapAll(elements));
     }
 
-    public JsNode[] getElementsByClassName(String className) {
+    public Object getElementsByClassName(String className) {
         if (className == null || className.isBlank()) {
-            return new JsNode[0];
+            return ctx.toJsNodeArray(new JsNode[0]);
         }
 
-        return wrapAll(
+        return ctx.toJsNodeArray(wrapAll(
                 element.getElementsByClass(className)
-        );
+        ));
     }
 
     public JsNode getElementById(String id) {
@@ -953,6 +1027,17 @@ public final class JsNode implements ExpandoHost {
 
         private final Runnable layoutInvalidator;
         private final FunctionInvoker invoker;
+        private Scriptable globalScope;
+
+        private JsDocument document;
+
+        public void setDocument(JsDocument document) {
+            this.document = document;
+        }
+
+        public JsDocument getDocument() {
+            return document;
+        }
 
         private final Map<Element, JsNode> cache =
                 new IdentityHashMap<>();
@@ -972,6 +1057,16 @@ public final class JsNode implements ExpandoHost {
                             : (listener, event) -> {};
         }
 
+        /** Must be called once after the Rhino global scope is created so node lists
+         *  can store properly-wrapped Scriptable values (required for typeof / forEach). */
+        public void setGlobalScope(Scriptable scope) {
+            this.globalScope = scope;
+        }
+
+        public Scriptable getGlobalScope() {
+            return globalScope;
+        }
+
         public void invalidate() {
             layoutInvalidator.run();
         }
@@ -989,6 +1084,50 @@ public final class JsNode implements ExpandoHost {
                     element,
                     e -> new JsNode(e, this)
             );
+        }
+
+        /**
+         * Build a Rhino NativeArray whose elements are already wrapped as
+         * Scriptable (via the configured WrapFactory). Putting raw JsNode
+         * instances into a NativeArray causes
+         * "Invalid JavaScript value of type ...JsNode" when page scripts
+         * (notably Closure / reCAPTCHA) call Array.prototype.forEach or
+         * typeof on the entries.
+         */
+        public Object toJsNodeArray(JsNode[] nodes) {
+            Context cx = Context.getCurrentContext();
+            Scriptable scope = globalScope;
+
+            // Prefer Context.newArray so the result is a real JS Array with
+            // Array.prototype / constructor / @@species. Bare `new NativeArray`
+            // breaks Array.prototype.filter.call(nodes, …) with:
+            //   TypeError: Constructor for "NativeArray@…" not found
+            if (nodes == null || nodes.length == 0) {
+                if (cx != null && scope != null) {
+                    return cx.newArray(scope, 0);
+                }
+                return new NativeArray(0); // last-resort; no scope available
+            }
+
+            Object[] jsValues = new Object[nodes.length];
+            for (int i = 0; i < nodes.length; i++) {
+                JsNode n = nodes[i];
+                if (n == null) {
+                    jsValues[i] = null;
+                } else if (cx != null && scope != null) {
+                    // javaToJS goes through the Context's WrapFactory, producing
+                    // ExpandoAwareJavaObject so typeof / forEach see a real Scriptable.
+                    jsValues[i] = Context.javaToJS(n, scope);
+                } else {
+                    // Fallback (should not happen after setGlobalScope): keep raw host.
+                    jsValues[i] = n;
+                }
+            }
+
+            if (cx != null && scope != null) {
+                return cx.newArray(scope, jsValues);
+            }
+            return new NativeArray(jsValues);
         }
 
         public void clearCache() {
@@ -1204,5 +1343,56 @@ public final class JsNode implements ExpandoHost {
         Element frag = new Element(Tag.valueOf("div"), "");
         frag.attr("data-jsnode-fragment", "true");
         return ctx.wrap(frag);
+    }
+
+    // in JsNode
+    public JsDocument getOwnerDocument() {
+        JsDocument doc = ctx.getDocument();
+        if (doc == null) {
+            org.tinylog.Logger.warn("[DOM] ownerDocument == null for <{}> (tag={})",
+                    System.identityHashCode(this), element.tagName());
+        }
+        return doc;
+    }
+
+    public int getNodeType() {
+        if (isFakeTextNode()) {
+            return 3; // TEXT_NODE
+        }
+        // Document nodes must report 9, otherwise Closure’s getOwnerDocument breaks
+        if (element instanceof org.jsoup.nodes.Document) {
+            return 9; // DOCUMENT_NODE
+        }
+        return 1; // ELEMENT_NODE
+    }
+
+    public Object getChildNodes() {
+        Context cx = Context.getCurrentContext();
+        Scriptable scope = ctx.getGlobalScope();
+
+        Object[] nodes = element.childNodes().stream()
+                .map(node -> {
+                    if (node instanceof Element child) {
+                        return ctx.wrap(child);
+                    }
+
+                    JsNode textNode = ctx.wrap(element);
+                    textNode.setAttribute(TEXT_NODE_ATTR, "true");
+                    textNode.setTextContent(node.toString());
+                    return textNode;
+                })
+                .toArray();
+
+        if (cx != null && scope != null) {
+            Object[] jsValues = new Object[nodes.length];
+
+            for (int i = 0; i < nodes.length; i++) {
+                jsValues[i] = Context.javaToJS(nodes[i], scope);
+            }
+
+            return cx.newArray(scope, jsValues);
+        }
+
+        return new NativeArray(nodes);
     }
 }

@@ -1,6 +1,7 @@
 package com.peak885.peakybrowser4jv2.browser.render.layout;
 
 import com.peak885.peakybrowser4jv2.browser.image.ImageData;
+import com.peak885.peakybrowser4jv2.browser.js.CanvasRenderingContext2D;
 import com.peak885.peakybrowser4jv2.browser.render.style.ComputedStyle;
 import org.jsoup.nodes.Element;
 
@@ -11,10 +12,11 @@ public final class ElementBox extends Box {
 
     private final Element element;
     private final ImageData captchaImage;
+    private final CanvasRenderingContext2D canvas;
     private boolean focused;
 
     public ElementBox(ComputedStyle style, Element element) {
-        this(style, element, null);
+        this(style, element, null, null);
     }
 
     public ElementBox(
@@ -22,9 +24,14 @@ public final class ElementBox extends Box {
             Element element,
             ImageData captchaImage
     ) {
+        this(style, element, captchaImage, null);
+    }
+
+    public ElementBox(ComputedStyle style, Element element, ImageData captchaImage, CanvasRenderingContext2D canvas) {
         super(style);
         this.element = element;
         this.captchaImage = captchaImage;
+        this.canvas = canvas;
         this.sourceElement = element;
     }
 
@@ -133,6 +140,10 @@ public final class ElementBox extends Box {
 
     @Override
     public void paint(Graphics2D g) {
+        if (canvas != null) {
+            g.drawImage(canvas.image(), Math.round(x), Math.round(y), Math.max(0, Math.round(width)), Math.max(0, Math.round(height)), null);
+            return;
+        }
         if (captchaImage != null) {
             paintCaptchaImage(g);
             return;
