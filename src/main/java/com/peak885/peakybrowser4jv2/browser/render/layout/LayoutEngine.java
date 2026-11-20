@@ -383,13 +383,16 @@ public final class LayoutEngine {
                 ElementBox elementBox = new ElementBox(style, element, captchaImage);
                 elementBox.sourceElement = element;
 
-                collector.buffer.add(
-                        InlineBox.inlineBlock(
-                                style,
-                                elementBox,
-                                currentHref
-                        )
+                InlineBox wrapper = InlineBox.inlineBlock(
+                        style,
+                        elementBox,
+                        currentHref
                 );
+                // So hover/active hit-testing and restyle can see the control
+                // even if a path only looks at the inline-block wrapper.
+                wrapper.sourceElement = element;
+
+                collector.buffer.add(wrapper);
 
                 collector.pendingSpace = false;
                 continue;

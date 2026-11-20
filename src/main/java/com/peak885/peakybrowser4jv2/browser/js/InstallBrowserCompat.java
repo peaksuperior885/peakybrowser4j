@@ -19,6 +19,56 @@ public final class InstallBrowserCompat {
         installMiscellaneous(cx, scope);
         installExceptionHandling(cx, scope);
         installDomConstructors(cx, scope);
+        installWebStorage(cx, scope);
+    }
+
+    // ---------------------------------------------------------------------
+    // sessionStorage / localStorage (in-memory Web Storage API)
+    // ---------------------------------------------------------------------
+
+    private void installWebStorage(Context cx, Scriptable scope) {
+        String source = """
+            (function() {
+                function Storage() {
+                    this._data = Object.create(null);
+                }
+                Storage.prototype.getItem = function(key) {
+                    key = String(key);
+                    return (key in this._data) ? this._data[key] : null;
+                };
+                Storage.prototype.setItem = function(key, value) {
+                    key = String(key);
+                    this._data[key] = String(value);
+                };
+                Storage.prototype.removeItem = function(key) {
+                    key = String(key);
+                    delete this._data[key];
+                };
+                Storage.prototype.clear = function() {
+                    this._data = Object.create(null);
+                };
+                Storage.prototype.key = function(index) {
+                    var keys = Object.keys(this._data);
+                    index = index | 0;
+                    return (index >= 0 && index < keys.length) ? keys[index] : null;
+                };
+                // length as a live getter is ideal; approximate with a method-like
+                // property that pages mostly read as storage.length after mutations.
+                Object.defineProperty(Storage.prototype, 'length', {
+                    get: function() {
+                        return Object.keys(this._data).length;
+                    }
+                });
+
+                if (typeof sessionStorage === 'undefined') {
+                    this.sessionStorage = new Storage();
+                }
+                if (typeof localStorage === 'undefined') {
+                    this.localStorage = new Storage();
+                }
+            })();
+            """;
+        cx.evaluateString(scope, source, "browser-web-storage", 1, null);
     }
 
     // ---------------------------------------------------------------------

@@ -852,6 +852,7 @@ public final class Inputs implements MouseListener, MouseMotionListener {
                         ? box.sourceElement
                         : inherited;
 
+        // 1. Normal children first (innermost wins)
         for (Box child : box.children) {
             Element found =
                     findElementAt(
@@ -861,6 +862,23 @@ public final class Inputs implements MouseListener, MouseMotionListener {
                             py
                     );
 
+            if (found != null) {
+                return found;
+            }
+        }
+
+        // 2. Form controls / inline-blocks live in blockContent, not children.
+        //    Without this, hover lands on the parent and .btn:hover never matches.
+        if (box instanceof InlineBox inline
+                && inline.isInlineBlock()
+                && inline.blockContent() != null) {
+            Element found =
+                    findElementAt(
+                            inline.blockContent(),
+                            current,
+                            px,
+                            py
+                    );
             if (found != null) {
                 return found;
             }

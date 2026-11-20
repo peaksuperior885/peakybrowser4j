@@ -102,7 +102,7 @@ public final class JsAsyncTransformer {
                     transformAwait(body);
 
             String replacement =
-                    "function "
+                    ";function "
                             + functionName
                             + "("
                             + extractParameters(parametersAndHeader)
@@ -135,56 +135,238 @@ public final class JsAsyncTransformer {
         return header.substring(0, close).trim();
     }
 
-    /** Find the '{' that opens the function body, respecting strings. */
+    /** Find the '{' that opens the function body, respecting strings / regex / templates. */
     private static int findFunctionBodyStart(String script, int start) {
-        boolean inString = false;
-        char stringChar = 0;
-        boolean escaped = false;
-
+        ScanState st = new ScanState();
         for (int i = start; i < script.length(); i++) {
-            char c = script.charAt(i);
-            if (inString) {
-                if (escaped) { escaped = false; continue; }
-                if (c == '\\') { escaped = true; continue; }
-                if (c == stringChar) inString = false;
+            if (st.consume(script, i)) {
                 continue;
             }
-            if (c == '"' || c == '\'') {
-                inString = true;
-                stringChar = c;
-                continue;
+            if (script.charAt(i) == '{') {
+                return i;
             }
-            if (c == '{') return i;
         }
         return -1;
     }
 
     private static int findMatchingBrace(String script, int openingBrace) {
         int depth = 0;
-        boolean inString = false;
-        char stringChar = 0;
-        boolean escaped = false;
+        ScanState st = new ScanState();
 
         for (int i = openingBrace; i < script.length(); i++) {
+            if (st.consume(script, i)) {
+                continue;
+            }
             char c = script.charAt(i);
-            if (inString) {
-                if (escaped) { escaped = false; continue; }
-                if (c == '\\') { escaped = true; continue; }
-                if (c == stringChar) inString = false;
-                continue;
-            }
-            if (c == '"' || c == '\'') {
-                inString = true;
-                stringChar = c;
-                continue;
-            }
-            if (c == '{') depth++;
-            else if (c == '}') {
+            if (c == '{') {
+                depth++;
+            } else if (c == '}') {
                 depth--;
-                if (depth == 0) return i;
+                if (depth == 0) {
+                    return i;
+                }
             }
         }
         return -1;
+    }
+
+    /**
+     * Tracks whether the scanner is inside a string, template literal,
+     * comment, or regex literal so braces inside them do not affect matching.
+     * <p>
+     * Critical for page scripts that contain patterns like
+     * {@code .replace(/"/g, ...)} — without regex awareness the {@code "}
+     * opens a fake string and the function body never appears to close, so
+     * the async transform is skipped and {@code await} is later stripped,
+     * racing the caller past the Promise.
+     */
+    private static final class ScanState {
+        private static final int CODE = 0;
+        private static final int STRING = 1;
+        private static final int TEMPLATE = 2;
+        private static final int REGEX = 3;
+        private static final int LINE_COMMENT = 4;
+        private static final int BLOCK_COMMENT = 5;
+
+        private int mode = CODE;
+        private char stringChar;
+        private boolean escaped;
+        private boolean inRegexClass;
+        /** Depth of nested ${} expressions inside a template literal. */
+        private int templateExprDepth;
+        /** True when the current STRING was opened inside a template ${}. */
+        private boolean stringFromTemplate;
+
+        /**
+         * @return true if the current character is inside a non-code region
+         *         (caller should not treat it as a structural brace)
+         */
+        boolean consume(String script, int i) {
+            char c = script.charAt(i);
+
+            switch (mode) {
+                case STRING -> {
+                    if (escaped) {
+                        escaped = false;
+                        return true;
+                    }
+                    if (c == '\\') {
+                        escaped = true;
+                        return true;
+                    }
+                    if (c == stringChar) {
+                        mode = stringFromTemplate ? TEMPLATE : CODE;
+                        stringFromTemplate = false;
+                    }
+                    return true;
+                }
+                case TEMPLATE -> {
+                    if (escaped) {
+                        escaped = false;
+                        return true;
+                    }
+                    if (c == '\\') {
+                        escaped = true;
+                        return true;
+                    }
+                    if (templateExprDepth == 0) {
+                        if (c == '`') {
+                            mode = CODE;
+                            return true;
+                        }
+                        if (c == '$' && i + 1 < script.length()
+                                && script.charAt(i + 1) == '{') {
+                            // ${ starts an expression — braces inside must count.
+                            // Stay in TEMPLATE mode but raise expr depth; the
+                            // following '{' is still "inside template" for the
+                            // string sense, but we return false so caller depth++.
+                            templateExprDepth = 1;
+                            return true; // consume '$'; '{' handled next iter
+                        }
+                        return true;
+                    }
+                    // Inside ${ ... }: structural braces count for the
+                    // outer function matcher, so return false for { }.
+                    if (c == '{') {
+                        templateExprDepth++;
+                        return false;
+                    }
+                    if (c == '}') {
+                        templateExprDepth--;
+                        return false;
+                    }
+                    // Still need to track nested strings inside the expression
+                    if (c == '"' || c == '\'') {
+                        mode = STRING;
+                        stringChar = c;
+                        stringFromTemplate = true;
+                        escaped = false;
+                        return true;
+                    }
+                    return true;
+                }
+                case REGEX -> {
+                    if (escaped) {
+                        escaped = false;
+                        return true;
+                    }
+                    if (c == '\\') {
+                        escaped = true;
+                        return true;
+                    }
+                    if (c == '[') {
+                        inRegexClass = true;
+                        return true;
+                    }
+                    if (c == ']' && inRegexClass) {
+                        inRegexClass = false;
+                        return true;
+                    }
+                    if (c == '/' && !inRegexClass) {
+                        mode = CODE;
+                    }
+                    return true;
+                }
+                case LINE_COMMENT -> {
+                    if (c == '\n' || c == '\r') {
+                        mode = CODE;
+                    }
+                    return true;
+                }
+                case BLOCK_COMMENT -> {
+                    if (c == '*' && i + 1 < script.length()
+                            && script.charAt(i + 1) == '/') {
+                        // Will still be in BLOCK_COMMENT for the '/', which is fine.
+                        // Advance: set a one-shot to close on next char.
+                        // Simpler: check pair and if next is /, close after
+                        // treating both as comment. On '*', peek '/'.
+                        // Close at the '/' by setting mode on '*" when next is /.
+                        // For '*', stay; for following '/', exit:
+                    }
+                    // Close when we see '/' and previous was '*'
+                    if (c == '/' && i > 0 && script.charAt(i - 1) == '*') {
+                        mode = CODE;
+                    }
+                    return true;
+                }
+                default -> {
+                    // CODE
+                    if (c == '"' || c == '\'') {
+                        mode = STRING;
+                        stringChar = c;
+                        escaped = false;
+                        stringFromTemplate = false;
+                        return true;
+                    }
+                    if (c == '`') {
+                        mode = TEMPLATE;
+                        templateExprDepth = 0;
+                        escaped = false;
+                        return true;
+                    }
+                    if (c == '/' && i + 1 < script.length()) {
+                        char n = script.charAt(i + 1);
+                        if (n == '/') {
+                            mode = LINE_COMMENT;
+                            return true;
+                        }
+                        if (n == '*') {
+                            mode = BLOCK_COMMENT;
+                            return true;
+                        }
+                        if (looksLikeRegexStart(script, i)) {
+                            mode = REGEX;
+                            inRegexClass = false;
+                            escaped = false;
+                            return true;
+                        }
+                    }
+                    // Returning from a string that was nested in a template
+                    // expression: if templateExprDepth > 0 and we just left
+                    // STRING, mode is already CODE here — restore TEMPLATE.
+                    // (Handled by not switching to CODE from STRING when
+                    // templateExprDepth > 0 — fixed below in STRING exit.)
+                    return false;
+                }
+            }
+        }
+    }
+
+    private static boolean looksLikeRegexStart(String script, int slashIndex) {
+        int j = slashIndex - 1;
+        while (j >= 0 && Character.isWhitespace(script.charAt(j))) {
+            j--;
+        }
+        if (j < 0) {
+            return true;
+        }
+        char p = script.charAt(j);
+        // After identifier / number / ) ] } → division, not regex.
+        if (Character.isLetterOrDigit(p) || p == '_' || p == '$'
+                || p == ')' || p == ']' || p == '}') {
+            return false;
+        }
+        return true;
     }
 
     /**

@@ -243,6 +243,12 @@ public abstract class Box {
                 return true;
             }
         }
+        // Form controls / inline-blocks store their real box in blockContent
+        if (this instanceof InlineBox inline
+                && inline.isInlineBlock()
+                && inline.blockContent() != null) {
+            return inline.blockContent().hasRunningAnimation(nowMs);
+        }
         return false;
     }
 }

@@ -12,9 +12,10 @@ final class JsLoopTransformer {
     private JsLoopTransformer() {
     }
 
+
     static String transformForOf(String script) {
         Pattern pattern = Pattern.compile(
-                "(?:^|[;{}\\n])\\s*" +
+                "((?:^|[;{}\\n])\\s*)" +
                         "for\\s*\\(\\s*" +
                         "(?:const|let|var)\\s+" +
                         "([A-Za-z_$][A-Za-z0-9_$]*)" +
@@ -28,18 +29,23 @@ final class JsLoopTransformer {
         int loopCounter = 0;
 
         while (matcher.find()) {
-            String variable = matcher.group(1);
-            String iterable = matcher.group(2).trim();
+            String prefix = matcher.group(1);
+            String variable = matcher.group(2);
+            String iterable = matcher.group(3).trim();
             String indexVariable = "__rhino_for_index_" + loopCounter++;
 
             String replacement =
-                    "for (var " + indexVariable + " = 0; " +
+                    prefix +
+                            "for (var " + indexVariable + " = 0; " +
                             indexVariable + " < (" + iterable + ").length; " +
                             indexVariable + "++) { " +
                             "var " + variable + " = (" +
                             iterable + ")[" + indexVariable + "];";
 
-            matcher.appendReplacement(result, Matcher.quoteReplacement(replacement));
+            matcher.appendReplacement(
+                    result,
+                    Matcher.quoteReplacement(replacement)
+            );
         }
 
         matcher.appendTail(result);

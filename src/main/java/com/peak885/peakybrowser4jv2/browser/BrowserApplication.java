@@ -10,7 +10,6 @@ import javax.swing.SwingUtilities;
 public final class BrowserApplication {
 
     static {
-        // ── THE CRITICAL FIX: Intercept the ph-css parser thread crash globally ──
         try {
             CSSReader.setDefaultParseExceptionHandler(new ICSSParseExceptionCallback() {
                 @Override

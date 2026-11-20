@@ -175,22 +175,17 @@ public final class ElementBox extends Box {
         );
     }
 
-    private void paintInput(Graphics2D g) {
-        fillControlBackground(g, Color.WHITE, true);
+    // ------------------------------------------------------------------
+    // Style-driven control painting (fully CSS / transition aware)
+    // ------------------------------------------------------------------
 
-        // Focus ring
-        if (focused) {
-            g.setColor(new Color(60, 120, 220));
-            g.setStroke(new BasicStroke(2f));
-        } else {
-            g.setColor(new Color(150, 150, 150));
-            g.setStroke(new BasicStroke(1f));
-        }
-        g.drawRoundRect(Math.round(x), Math.round(y), Math.round(width), Math.round(height), 6, 6);
-        g.setStroke(new BasicStroke(1f));
+    private void paintInput(Graphics2D g) {
+        Color fallback = Color.WHITE;
+        paintControlChrome(g, fallback);
 
         String type = element.attr("type").toLowerCase();
         String display;
+        Color textColor = style.color();
         if (type.equals("password")) {
             String raw = value();
             display = "*".repeat(raw.length());
@@ -198,20 +193,24 @@ public final class ElementBox extends Box {
             display = value();
             if (display.isBlank() && element.hasAttr("placeholder")) {
                 display = element.attr("placeholder");
-                g.setColor(new Color(120, 120, 120));
-            } else {
-                g.setColor(style.color());
+                textColor = new Color(120, 120, 120);
             }
         }
 
         if (!display.isBlank()) {
             g.setFont(createFont());
+            g.setColor(textColor);
             FontMetrics fm = g.getFontMetrics();
-            int textX = Math.round(x + 8);
-            int textY = Math.round(y + (height - fm.getHeight()) / 2f + fm.getAscent());
-            // Clip to control width
+            float padL = effectivePaddingLeft();
+            int textX = Math.round(borderBoxX + padL);
+            int textY = Math.round(borderBoxY + (borderBoxHeight - fm.getHeight()) / 2f + fm.getAscent());
             Shape oldClip = g.getClip();
-            g.clipRect(Math.round(x + 4), Math.round(y), Math.round(width - 8), Math.round(height));
+            g.clipRect(
+                    Math.round(borderBoxX + 2),
+                    Math.round(borderBoxY),
+                    Math.max(0, Math.round(borderBoxWidth - 4)),
+                    Math.round(borderBoxHeight)
+            );
             g.drawString(display, textX, textY);
             g.setClip(oldClip);
         }
@@ -219,12 +218,7 @@ public final class ElementBox extends Box {
 
     private void paintButton(Graphics2D g) {
         Color fallback = focused ? new Color(220, 230, 250) : new Color(240, 240, 240);
-        fillControlBackground(g, fallback, true);
-
-        g.setColor(focused ? new Color(60, 120, 220) : new Color(140, 140, 140));
-        g.setStroke(new BasicStroke(focused ? 2f : 1f));
-        g.drawRoundRect(Math.round(x), Math.round(y), Math.round(width), Math.round(height), 6, 6);
-        g.setStroke(new BasicStroke(1f));
+        paintControlChrome(g, fallback);
 
         String text = element.text();
         if (text.isBlank()) {
@@ -233,24 +227,14 @@ public final class ElementBox extends Box {
         g.setFont(createFont());
         FontMetrics fm = g.getFontMetrics();
         int textWidth = fm.stringWidth(text);
-        int textX = Math.round(x + (width - textWidth) / 2f);
-        int textY = Math.round(y + (height - fm.getHeight()) / 2f + fm.getAscent());
+        int textX = Math.round(borderBoxX + (borderBoxWidth - textWidth) / 2f);
+        int textY = Math.round(borderBoxY + (borderBoxHeight - fm.getHeight()) / 2f + fm.getAscent());
         g.setColor(style.color());
         g.drawString(text, textX, textY);
     }
 
     private void paintTextarea(Graphics2D g) {
-        fillControlBackground(g, Color.WHITE, false);
-
-        if (focused) {
-            g.setColor(new Color(60, 120, 220));
-            g.setStroke(new BasicStroke(2f));
-        } else {
-            g.setColor(new Color(150, 150, 150));
-            g.setStroke(new BasicStroke(1f));
-        }
-        g.drawRect(Math.round(x), Math.round(y), Math.round(width), Math.round(height));
-        g.setStroke(new BasicStroke(1f));
+        paintControlChrome(g, Color.WHITE);
 
         String text = value();
         if (!text.isBlank()) {
@@ -258,74 +242,197 @@ public final class ElementBox extends Box {
             g.setColor(style.color());
             FontMetrics fm = g.getFontMetrics();
             int lineH = fm.getHeight();
-            int textX = Math.round(x + 6);
-            int textY = Math.round(y + 4 + fm.getAscent());
+            float padL = effectivePaddingLeft();
+            float padT = effectivePaddingTop();
+            int textX = Math.round(borderBoxX + padL);
+            int textY = Math.round(borderBoxY + padT + fm.getAscent());
             Shape oldClip = g.getClip();
-            g.clipRect(Math.round(x + 2), Math.round(y + 2), Math.round(width - 4), Math.round(height - 4));
-            // Simple multi-line (split on \n only)
+            g.clipRect(
+                    Math.round(borderBoxX + 2),
+                    Math.round(borderBoxY + 2),
+                    Math.max(0, Math.round(borderBoxWidth - 4)),
+                    Math.max(0, Math.round(borderBoxHeight - 4))
+            );
             for (String line : text.split("\n", -1)) {
                 g.drawString(line, textX, textY);
                 textY += lineH;
-                if (textY > y + height) break;
+                if (textY > borderBoxY + borderBoxHeight) break;
             }
             g.setClip(oldClip);
         }
     }
 
     private void paintSelect(Graphics2D g) {
-        fillControlBackground(g, Color.WHITE, true);
+        paintControlChrome(g, Color.WHITE);
 
-        g.setColor(focused ? new Color(60, 120, 220) : new Color(150, 150, 150));
-        g.setStroke(new BasicStroke(focused ? 2f : 1f));
-        g.drawRoundRect(Math.round(x), Math.round(y), Math.round(width), Math.round(height), 6, 6);
-        g.setStroke(new BasicStroke(1f));
-
-        String text = element.select("option").first() != null
-                ? element.select("option").first().text()
-                : "";
+        String text = "Select…";
+        for (org.jsoup.nodes.Element opt : element.select("option")) {
+            if (opt.hasAttr("selected") || text.equals("Select…")) {
+                String t = opt.text();
+                if (!t.isBlank()) {
+                    text = t;
+                    if (opt.hasAttr("selected")) break;
+                }
+            }
+        }
         g.setFont(createFont());
-        g.setColor(style.color());
         FontMetrics fm = g.getFontMetrics();
-        g.drawString(text,
-                Math.round(x + 8),
-                Math.round(y + (height - fm.getHeight()) / 2f + fm.getAscent()));
+        float padL = effectivePaddingLeft();
+        g.setColor(style.color());
+        g.drawString(
+                text,
+                Math.round(borderBoxX + padL),
+                Math.round(borderBoxY + (borderBoxHeight - fm.getHeight()) / 2f + fm.getAscent())
+        );
+
+        // Simple dropdown chevron on the right
+        int chevronSize = 4;
+        int cx = Math.round(borderBoxX + borderBoxWidth - Math.max(12, effectivePaddingRight()) - chevronSize);
+        int cy = Math.round(borderBoxY + borderBoxHeight / 2f);
+        g.setColor(style.color());
+        g.fillPolygon(
+                new int[]{cx - chevronSize, cx + chevronSize, cx},
+                new int[]{cy - 2, cy - 2, cy + chevronSize},
+                3
+        );
     }
 
     /**
-     * Fills the control with {@link ComputedStyle#backgroundPaint}, which
-     * already routes through {@link com.peak885.peakybrowser4jv2.browser.render.style.GradientParser}
-     * for linear-/radial-gradient. Falls back to {@code fallback} when the
-     * resolved paint is null or fully transparent.
+     * Shared chrome for form controls: box-shadow, background (incl. animated
+     * transitions), border, and optional focus ring. All values come from
+     * {@link ComputedStyle} so CSS transitions on background / border-color /
+     * border-radius / box-shadow actually animate.
      */
-    private void fillControlBackground(Graphics2D g, Color fallback, boolean rounded) {
-        int ix = Math.round(x);
-        int iy = Math.round(y);
-        int iw = Math.round(width);
-        int ih = Math.round(height);
-        int diameter = rounded ? 6 : 0;
+    private void paintControlChrome(Graphics2D g, Color fallbackBg) {
+        int bx = Math.round(borderBoxX);
+        int by = Math.round(borderBoxY);
+        int bw = Math.round(borderBoxWidth);
+        int bh = Math.round(borderBoxHeight);
+        if (bw <= 0 || bh <= 0) return;
 
-        paintBoxShadow(g, ix, iy, iw, ih, diameter);
+        float radius = style.borderRadius();
+        // Sensible default when author CSS does not set radius
+        if (radius <= 0f) {
+            radius = 4f;
+        }
+        int diameter = Math.round(radius * 2);
 
-        Paint background = style.backgroundPaint(width, height);
-        boolean visible = false;
-        if (background != null) {
-            if (background instanceof Color color) {
-                visible = color.getAlpha() > 0;
+        long now = System.currentTimeMillis();
+        Color animBg = null;
+        ComputedStyle.BoxShadow animShadow = null;
+        ComputedStyle.Transform tx = style.transform();
+        if (anim != null) {
+            if (anim.done(now)) {
+                anim = null;
             } else {
-                // Gradients / other paints are always drawn
-                visible = true;
+                animBg = anim.background(now);
+                animShadow = anim.shadow(now);
+                tx = anim.transform(now);
             }
         }
-        if (visible) {
-            g.setPaint(background);
-        } else {
-            g.setColor(fallback);
+
+        java.awt.geom.AffineTransform saved = null;
+        if (!tx.isIdentity()) {
+            saved = g.getTransform();
+            float cx = borderBoxX + borderBoxWidth / 2f;
+            float cy = borderBoxY + borderBoxHeight / 2f;
+            g.translate(cx + tx.translateX(), cy + tx.translateY());
+            g.rotate(Math.toRadians(tx.rotateDeg()));
+            g.scale(tx.scaleX(), tx.scaleY());
+            g.translate(-cx, -cy);
         }
-        if (rounded) {
-            g.fillRoundRect(ix, iy, iw, ih, 6, 6);
+
+        // Shadow (animated when a transition is active)
+        paintBoxShadow(g, bx, by, bw, bh, diameter, animShadow);
+
+        // Background – prefer animated solid color, else style paint, else fallback
+        if (animBg != null) {
+            g.setColor(animBg);
+            fillRounded(g, bx, by, bw, bh, diameter);
         } else {
-            g.fillRect(ix, iy, iw, ih);
+            Paint background = style.backgroundPaint(borderBoxWidth, borderBoxHeight);
+            boolean visible = false;
+            if (background != null) {
+                if (background instanceof Color color) {
+                    visible = color.getAlpha() > 0;
+                } else {
+                    visible = true; // gradients
+                }
+            }
+            if (visible) {
+                g.setPaint(background);
+            } else {
+                g.setColor(fallbackBg);
+            }
+            fillRounded(g, bx, by, bw, bh, diameter);
         }
+
+        // Border
+        float borderW = Math.max(
+                style.borderTopWidth(),
+                Math.max(style.borderRightWidth(),
+                        Math.max(style.borderBottomWidth(), style.borderLeftWidth()))
+        );
+        if (borderW <= 0f) {
+            borderW = 1f; // default hairline for form controls
+        }
+        Color borderColor = style.borderColor();
+        if (borderColor == null || borderColor.getAlpha() == 0) {
+            borderColor = focused ? new Color(60, 120, 220) : new Color(150, 150, 150);
+        } else if (focused) {
+            // Slightly stronger focus indication when author already set a border color
+            borderColor = blendToward(borderColor, new Color(60, 120, 220), 0.45f);
+            borderW = Math.max(borderW, 1.5f);
+        }
+
+        g.setColor(borderColor);
+        g.setStroke(new BasicStroke(borderW));
+        drawRounded(g, bx, by, bw, bh, diameter);
+        g.setStroke(new BasicStroke(1f));
+
+        if (saved != null) {
+            g.setTransform(saved);
+        }
+    }
+
+    private static void fillRounded(Graphics2D g, int x, int y, int w, int h, int diameter) {
+        if (diameter > 0) {
+            g.fillRoundRect(x, y, w, h, diameter, diameter);
+        } else {
+            g.fillRect(x, y, w, h);
+        }
+    }
+
+    private static void drawRounded(Graphics2D g, int x, int y, int w, int h, int diameter) {
+        if (diameter > 0) {
+            g.drawRoundRect(x, y, w, h, diameter, diameter);
+        } else {
+            g.drawRect(x, y, w, h);
+        }
+    }
+
+    private static Color blendToward(Color from, Color toward, float t) {
+        t = Math.max(0f, Math.min(1f, t));
+        int r = Math.round(from.getRed() + (toward.getRed() - from.getRed()) * t);
+        int g = Math.round(from.getGreen() + (toward.getGreen() - from.getGreen()) * t);
+        int b = Math.round(from.getBlue() + (toward.getBlue() - from.getBlue()) * t);
+        int a = Math.round(from.getAlpha() + (toward.getAlpha() - from.getAlpha()) * t);
+        return new Color(r, g, b, a);
+    }
+
+    private float effectivePaddingLeft() {
+        float p = style.paddingLeft();
+        return p > 0 ? p : 8f;
+    }
+
+    private float effectivePaddingRight() {
+        float p = style.paddingRight();
+        return p > 0 ? p : 8f;
+    }
+
+    private float effectivePaddingTop() {
+        float p = style.paddingTop();
+        return p > 0 ? p : 4f;
     }
 
     private void paintBoxShadow(
@@ -334,9 +441,10 @@ public final class ElementBox extends Box {
             int by,
             int bw,
             int bh,
-            int diameter
+            int diameter,
+            ComputedStyle.BoxShadow override
     ) {
-        ComputedStyle.BoxShadow shadow = style.boxShadow();
+        ComputedStyle.BoxShadow shadow = override != null ? override : style.boxShadow();
         if (shadow == null || bw <= 0 || bh <= 0) {
             return;
         }

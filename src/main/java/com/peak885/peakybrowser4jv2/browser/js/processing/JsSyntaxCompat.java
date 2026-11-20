@@ -260,6 +260,8 @@ final class JsSyntaxCompat {
     static String normalizeKeywords(String script) {
         script = script.replaceAll("\\bconst\\b", "var");
         script = script.replaceAll("\\blet\\b", "var");
+        script = script.replaceAll("\\basync\\s+function\\b", "function"); // <-- Strip async from function declarations
+        script = script.replaceAll("\\basync\\b", "");                     // <-- Strip standalone async keywords
         script = script.replaceAll("\\?\\.", ".");
         script = script.replaceAll(",\\s*\\)", ")");
         script = script.replaceAll(",\\s*\\]", "]");

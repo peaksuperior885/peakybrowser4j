@@ -1557,52 +1557,65 @@ public final class JsBridge {
         }
     }
 
+
     private org.mozilla.javascript.Function fetchFunction(JsFetch jsFetch) {
         return new org.mozilla.javascript.BaseFunction() {
             @Override
             public Object call(Context cx, Scriptable ignored, Scriptable thisObj, Object[] args) {
-                if (args.length == 0 || args[0] == null) {
+                if (args.length == 0 || isMissingJsValue(args[0])) {
                     throw Context.reportRuntimeError(
                             "TypeError: Failed to execute 'fetch': at least 1 argument required.");
                 }
 
-                // ---- parse input (url or Request-like object) ----
+                // ---- parse input (URL or Request-like object) ----
                 String url;
                 String method = "GET";
                 Map<String, String> headers = new LinkedHashMap<>();
                 String body = null;
 
                 Object input = args[0];
+
                 if (input instanceof Scriptable inputObj
                         && ScriptableObject.hasProperty(inputObj, "url")) {
+
                     // fetch(Request)
-                    url = Context.toString(ScriptableObject.getProperty(inputObj, "url"));
+                    Object requestUrl = ScriptableObject.getProperty(inputObj, "url");
+                    url = Context.toString(requestUrl);
+
                     Object m = ScriptableObject.getProperty(inputObj, "method");
-                    if (m != null && m != Undefined.instance) {
+                    if (!isMissingJsValue(m)) {
                         method = Context.toString(m);
                     }
+
                     Object h = ScriptableObject.getProperty(inputObj, "headers");
-                    extractHeaders(h, headers);
+                    if (!isMissingJsValue(h)) {
+                        extractHeaders(h, headers);
+                    }
+
                     Object b = ScriptableObject.getProperty(inputObj, "body");
-                    if (b != null && b != Undefined.instance) {
+                    if (!isMissingJsValue(b)) {
                         body = Context.toString(b);
                     }
+
                 } else {
                     url = Context.toString(input);
                 }
 
                 // ---- parse init options (second argument) ----
                 if (args.length > 1 && args[1] instanceof Scriptable init) {
+
                     Object m = ScriptableObject.getProperty(init, "method");
-                    if (m != null && m != Undefined.instance) {
+                    if (!isMissingJsValue(m)) {
                         method = Context.toString(m);
                     }
 
                     Object h = ScriptableObject.getProperty(init, "headers");
-                    extractHeaders(h, headers);
+                    if (!isMissingJsValue(h)) {
+                        extractHeaders(h, headers);
+                    }
 
                     Object b = ScriptableObject.getProperty(init, "body");
-                    if (b != null && b != Undefined.instance && b != null) {
+                    if (!isMissingJsValue(b)) {
                         body = Context.toString(b);
                     }
                 }
@@ -1612,25 +1625,43 @@ public final class JsBridge {
                 final Map<String, String> fHeaders = headers;
                 final String fBody = body;
 
-                Logger.info("[JS fetch] CALL method={} url={} headers={} bodyLen={}",
-                        fMethod, fUrl, fHeaders.size(),
-                        fBody == null ? 0 : fBody.length());
+                Logger.info(
+                        "[JS fetch] CALL method={} url={} headers={} bodyLen={}",
+                        fMethod,
+                        DiagnosticPaths.safeUrl(fUrl),
+                        fHeaders.size(),
+                        fBody == null ? 0 : fBody.length()
+                );
 
-                Scriptable deferred = (Scriptable) cx.evaluateString(scope,
+                // ---- create Promise ----
+                Scriptable deferred = (Scriptable) cx.evaluateString(
+                        scope,
                         "(function(){var resolve,reject;var promise=new Promise(function(r,j){resolve=r;reject=j;});return {promise:promise,resolve:resolve,reject:reject};})()",
-                        "fetch-promise", 1, null);
-                org.mozilla.javascript.Function resolve =
-                        (org.mozilla.javascript.Function) ScriptableObject.getProperty(deferred, "resolve");
-                org.mozilla.javascript.Function reject =
-                        (org.mozilla.javascript.Function) ScriptableObject.getProperty(deferred, "reject");
+                        "fetch-promise",
+                        1,
+                        null
+                );
 
+                org.mozilla.javascript.Function resolve =
+                        (org.mozilla.javascript.Function)
+                                ScriptableObject.getProperty(deferred, "resolve");
+
+                org.mozilla.javascript.Function reject =
+                        (org.mozilla.javascript.Function)
+                                ScriptableObject.getProperty(deferred, "reject");
+
+                // ---- execute HTTP request asynchronously ----
                 taskExecutor.execute(() -> {
                     try {
                         JsFetch.JsResponse response =
                                 jsFetch.request(fMethod, fUrl, fHeaders, fBody);
+
                         resolveFetch(resolve, response);
+
                     } catch (Exception e) {
-                        Logger.warn(e, "[JS fetch] network error for {}", fUrl);
+                        Logger.warn(e, "[JS fetch] network error for {}",
+                                DiagnosticPaths.safeUrl(fUrl));
+
                         invokeCallback(reject, new Object[]{
                                 "NetworkError: Failed to fetch: " + e.getMessage()
                         });
@@ -1640,6 +1671,12 @@ public final class JsBridge {
                 return ScriptableObject.getProperty(deferred, "promise");
             }
         };
+    }
+
+    private static boolean isMissingJsValue(Object value) {
+        return value == null
+                || value == Scriptable.NOT_FOUND
+                || value == Undefined.instance;
     }
 
     /**
