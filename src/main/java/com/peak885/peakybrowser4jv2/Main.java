@@ -6,7 +6,7 @@ public final class Main {
     public static void main(String[] args) {
         BrowserApplication.start(
                 //"internal:newtab"
-                //"https://www.google.com/search?q=example&gbv=1"
+                "https://www.google.com/search?q=example&gbv=1"
                 //"https://www.google.com/webhp?gbv=1"
                 //"https://peaksuperior885.github.io/"
                 //"https://www.curseforge.com/minecraft/mc-mods/blendin/download/8809095"
@@ -15,7 +15,7 @@ public final class Main {
                 //"https://peaksuperior885.github.io/testmp4/"
                 //"https://www.cursemaven.com"
                 //"https://repo1.maven.org/maven2/"
-                "https://peaksuperior885.github.io/peaks_maven/"
+                //"https://peaksuperior885.github.io/peaks_maven/"
         );
     }
 }

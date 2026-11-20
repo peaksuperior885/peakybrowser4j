@@ -53,9 +53,6 @@ dependencies {
     implementation 'org.tinylog:tinylog-api:2.8.0' //you know the saying, no logger = something wrong with you
     implementation 'org.tinylog:tinylog-impl:2.8.0' //you know the saying, no logger = something wrong with you
 
-    implementation 'com.google.javascript:closure-compiler:v20240317' //i hate recaptcha and it's stupid closure
-    implementation 'com.google.guava:guava:33.7.2-jre' //fuck greedy corporations
-
     compileOnly 'org.jetbrains:annotations:26.0.2' //annotations
 
     testImplementation platform('org.junit:junit-bom:5.10.0')
